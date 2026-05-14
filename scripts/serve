@@ -72,15 +72,9 @@ cat > "$ENTRYPOINT" <<'ENTRYEOF'
 #!/bin/sh
 set -e
 apk add --no-cache curl >/dev/null 2>&1
-# Download both binaries in parallel
 curl -fsSL --connect-timeout 10 --max-time 300 \
-    "https://caddyserver.com/api/download?os=linux&arch=amd64" -o /usr/local/bin/caddy &
-PID_CADDY=$!
-curl -fsSL --connect-timeout 10 --max-time 300 \
-    "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64" -o /usr/local/bin/cloudflared &
-PID_CF=$!
-wait $PID_CADDY $PID_CF
-chmod +x /usr/local/bin/caddy /usr/local/bin/cloudflared
+    "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64" -o /usr/local/bin/cloudflared
+chmod +x /usr/local/bin/cloudflared
 cd /serve
 caddy file-server --listen :80 &
 sleep 1
@@ -97,7 +91,7 @@ docker run -d --rm --name cf-serve \
     -v "$SERVE_DIR:/serve:ro" \
     -v "$ENTRYPOINT:/entrypoint.sh:ro" \
     -e TTL="$SECS" \
-    alpine:latest sh /entrypoint.sh
+    caddy:alpine sh /entrypoint.sh
 CONTAINER_EXIT=$?
 
 # Remove temp entrypoint immediately (mounted, inode stays until container exits)
@@ -110,7 +104,7 @@ fi
 
 # --- Poll for tunnel URL ---
 URL=""
-for i in $(seq 1 300); do
+for i in $(seq 1 120); do
     sleep 1
     # Check if container still exists
     docker inspect cf-serve --format '{{.State.Running}}' 2>/dev/null | grep -q true || {
