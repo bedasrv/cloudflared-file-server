@@ -33,8 +33,8 @@ Requires: Docker (`docker` command in PATH), outbound UDP on port 7844.
 ### As a Hermes Agent skill
 
 ```bash
-# Direct install
-hermes skills install https://raw.githubusercontent.com/bedasrv/cloudflared-file-server/main/SKILL.md
+# Direct install (use --force if scanner blocks community skills)
+hermes skills install --force https://raw.githubusercontent.com/bedasrv/cloudflared-file-server/main/SKILL.md
 
 # Or add repo as skill source
 hermes skills tap add bedasrv/cloudflared-file-server
