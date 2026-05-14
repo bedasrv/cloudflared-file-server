@@ -1,6 +1,6 @@
 ---
 name: cloudflared-file-server
-description: Serve files via Cloudflare Quick Tunnel — no account, auto-expiry. Single alpine container downloads caddy + cloudflared on the fly.
+description: Serve files via Cloudflare Quick Tunnel — no account, auto-expiry. Single caddy:alpine container downloads cloudflared on the fly.
 version: 3.0.0
 author: Hermes Agent
 license: MIT
@@ -11,12 +11,12 @@ metadata:
     min_hermes_version: "2.0"
     dependencies:
       commands: [docker]
-      images: [alpine:latest]
+      images: [caddy:alpine]
 ---
 
 # Cloudflared File Server
 
-Serve files via temporary Cloudflare Quick Tunnel URLs. No Cloudflare account needed. Single `alpine:latest` container — downloads `caddy` and `cloudflared` on first run, serves files, self-destructs after TTL.
+Serve files via temporary Cloudflare Quick Tunnel URLs. No Cloudflare account needed. Single `caddy:alpine` container — downloads `cloudflared` on first run, serves files, self-destructs after TTL. Caddy is pre-installed in the base image (no download needed).
 
 ## Trigger — When to Use This Skill
 
@@ -29,15 +29,15 @@ Load this skill whenever:
 ## Architecture
 
 ```
-Files on host  ──ro mount──→  alpine:latest container
-                               ├── Caddy file-server :80 (bg)
-                               ├── cloudflared tunnel → localhost:80 (fg)
-                               └── async sleep $TTL → kill self
+Files on host  ──ro mount──→  caddy:alpine container
+                               ├── Caddy file-server :80 (pre-installed)
+                               ├── cloudflared tunnel → localhost:80 (download once)
+                               └── async sleep $TTL → kill cloudflared → container exits
 
                                https://xxx.trycloudflare.com
 ```
 
-Single container, no Docker network, no pre-built image. Caddy + cloudflared binaries are downloaded fresh inside the container. Files mounted read-only via hard links (zero disk overhead).
+Single container, no Docker network, no pre-built image. Caddy comes from the `caddy:alpine` base image. Only cloudflared binary is downloaded fresh.
 
 ## Automated Serve Script
 
@@ -69,22 +69,23 @@ SERVE_DIR=/tmp/cloudflare-serve
 mkdir -p "$SERVE_DIR"
 ln /path/to/files/* "$SERVE_DIR/" 2>/dev/null || cp /path/to/files/* "$SERVE_DIR/"
 
-# 1. Start container (detached)
+# 1. Start container (detached, caddy is pre-installed)
 docker run -d --rm --name cf-serve \
   -v "$SERVE_DIR:/serve:ro" \
   -e TTL=300 \
-  alpine:latest \
+  caddy:alpine \
   sh -c '
 apk add --no-cache curl >/dev/null 2>&1
-curl -fsSL "https://caddyserver.com/api/download?os=linux&arch=amd64" -o /usr/local/bin/caddy
-chmod +x /usr/local/bin/caddy
-curl -fsSL "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64" -o /usr/local/bin/cloudflared
+curl -fsSL --connect-timeout 10 --max-time 300 \
+  "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64" -o /usr/local/bin/cloudflared
 chmod +x /usr/local/bin/cloudflared
 cd /serve
 caddy file-server --listen :80 &
-(sleep $TTL; kill $! $$ 2>/dev/null) &
 sleep 1
-exec cloudflared tunnel --url http://localhost:80
+cloudflared tunnel --url http://localhost:80 &
+CF_PID=$!
+(sleep $TTL; kill $CF_PID 2>/dev/null) &
+wait $CF_PID
 '
 
 # 2. Get URL
@@ -116,14 +117,14 @@ docker rm -f cf-serve
 - No SSE, no WebSocket support
 - No SLA — dev/testing only, not production
 - Subject to Cloudflare Terms of Service
-- First run downloads ~100MB (caddy + cloudflared binaries)
+- First run downloads ~25MB (cloudflared binary only; caddy is pre-installed)
 - Downloads happen per-invocation (no image caching)
 
 ## Pitfalls
 
 **Container name (`cf-serve`) is hardcoded.** Tear down old instances first if any conflict.
 
-**Downloads on every invocation.** Caddy (~35MB) + cloudflared (~25MB) are fetched fresh each run. If you need faster spin-up, consider pre-building an image.
+**Downloads on every invocation.** Cloudflared (~25MB) is fetched fresh each run. Caddy is pre-installed in the base image. If you need faster spin-up, consider pre-building an image.
 
 **File changes use hard links by default.** `ln` creates a hard link — same inode, zero extra disk space. Falls back to `cp` if cross-device.
 
