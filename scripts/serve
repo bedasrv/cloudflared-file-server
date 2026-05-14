@@ -2,13 +2,12 @@
 # cloudflared-serve — non-blocking Cloudflare Quick Tunnel file server
 # Spins up caddy:alpine, downloads cloudflared, serves files, self-destructs.
 # Usage: cloudflared-serve <ttl> <file1> [file2 ...]
-# TTL format: 30s, 5m, 1h
+# TTL format: 30s, 5m, 1h (minimum 10s)
 
-# To pin cloudflared to a specific version, set CLOUDFLARED_VERSION before
-# running (the download URL inside the container uses 'latest' by default):
+# To pin cloudflared to a specific version:
 #   CLOUDFLARED_VERSION=2025.2.1 cloudflared-serve 5m file.txt
-# This is passed as an env var into the container; edit the URL in the
-# entrypoint heredoc below to switch from 'latest' to a pinned release tag.
+# Default: 'latest' (GitHub redirects to newest release).
+CLOUDFLARED_VERSION="${CLOUDFLARED_VERSION:-latest}"
 set -euo pipefail
 
 usage() {
@@ -19,7 +18,7 @@ Serve files via temporary Cloudflare Quick Tunnel. Script returns immediately wi
 the tunnel URL. Container self-destructs after TTL.
 
 Arguments:
-  ttl      Auto-shutdown timer: 30s, 5m, 1h
+  ttl      Auto-shutdown timer: 30s, 5m, 1h (minimum 10s)
   file(s)  Files or directories to serve
 
 Examples:
@@ -32,6 +31,8 @@ EOF
 
 # --- Parse TTL (first argument) ---
 TTL="${1:-}"
+# shift may fail if called with 0 args (caught by [ -z "$TTL" ] above); || true
+# prevents set -e from aborting on the edge case where usage() has already run.
 shift 2>/dev/null || true
 
 [ -z "$TTL" ] && usage
@@ -45,6 +46,12 @@ esac
 
 # Reject non-numeric (e.g. 'abcm', 'm' → arithmetic produces 0 or empty)
 [[ "$SECS" =~ ^[0-9]+$ ]] || { echo "ERROR: Invalid TTL: $TTL" >&2; exit 1; }
+
+# Enforce minimum TTL — 0s/0m/0h kills container before URL is served
+if [ "$SECS" -lt 10 ]; then
+    echo "ERROR: TTL too short (minimum 10s, got ${SECS}s)" >&2
+    exit 1
+fi
 
 # --- Parse files ---
 FILES=("$@")
@@ -91,7 +98,12 @@ for f in "${FILES[@]}"; do
             cp -r "$f" "$SERVE_DIR/$name"
         fi
     else
-        ln "$f" "$SERVE_DIR/$name" 2>/dev/null || cp "$f" "$SERVE_DIR/$name"
+        if ln "$f" "$SERVE_DIR/$name" 2>/dev/null; then
+            : # hard link succeeded
+        else
+            echo "WARNING: hard link failed for '$f' (cross-device?), falling back to copy" >&2
+            cp "$f" "$SERVE_DIR/$name"
+        fi
     fi
 done
 
@@ -102,7 +114,22 @@ docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
 cat > "$ENTRYPOINT" <<'ENTRYEOF'
 #!/bin/sh
 set -e
-apk add --no-cache curl >/dev/null 2>&1
+
+# Trap SIGTERM for graceful shutdown (docker stop forwards it)
+cleanup() {
+    kill %1 %2 2>/dev/null || true   # caddy, cloudflared
+    wait 2>/dev/null || true
+}
+trap cleanup TERM INT
+
+# Install curl (or fall back to wget) for cloudflared download
+if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
+    apk add --no-cache curl >/dev/null 2>&1 || apk add --no-cache wget >/dev/null 2>&1 || {
+        echo "ERROR: failed to install curl or wget" >&2
+        exit 1
+    }
+fi
+
 # Detect architecture for cloudflared download
 ARCH=$(uname -m)
 case "$ARCH" in
@@ -111,13 +138,25 @@ case "$ARCH" in
   armv7l)  CF_ARCH="arm" ;;
   *)       echo "ERROR: unsupported architecture: $ARCH" >&2; exit 1 ;;
 esac
-# To pin a version, replace 'latest' with a release tag:
-#   releases/download/2025.2.1/cloudflared-linux-...
-curl -fsSL --connect-timeout 10 --max-time 300 \
-    "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${CF_ARCH}" -o /usr/local/bin/cloudflared
+
+# Download cloudflared (version pinning via CLOUDFLARED_VERSION env var)
+CLOUDFLARED_VERSION="${CLOUDFLARED_VERSION:-latest}"
+if [ "$CLOUDFLARED_VERSION" = "latest" ]; then
+    CLOUDFLARED_URL="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${CF_ARCH}"
+else
+    CLOUDFLARED_URL="https://github.com/cloudflare/cloudflared/releases/download/${CLOUDFLARED_VERSION}/cloudflared-linux-${CF_ARCH}"
+fi
+
+if command -v curl >/dev/null 2>&1; then
+    curl -fsSL --connect-timeout 10 --max-time 300 "$CLOUDFLARED_URL" -o /usr/local/bin/cloudflared
+else
+    wget -q --timeout=10 --tries=3 "$CLOUDFLARED_URL" -O /usr/local/bin/cloudflared
+fi
 chmod +x /usr/local/bin/cloudflared
+
 cd /serve
 caddy file-server --listen :80 &
+CADDY_PID=$!
 sleep 1
 cloudflared tunnel --url http://localhost:80 &
 CF_PID=$!
@@ -133,6 +172,7 @@ docker run -d --name "$CONTAINER_NAME" \
     -v "$SERVE_DIR:/serve:ro" \
     -v "$ENTRYPOINT:/entrypoint.sh:ro" \
     -e SECS="$SECS" \
+    -e CLOUDFLARED_VERSION="$CLOUDFLARED_VERSION" \
     --entrypoint sh \
     caddy:alpine /entrypoint.sh
 DOCKER_EXIT=$?
@@ -145,8 +185,17 @@ if [ "$DOCKER_EXIT" -ne 0 ]; then
     exit 1
 fi
 
-# Verify container actually started (docker run -d can succeed on image pull failure)
-if ! docker inspect "$CONTAINER_NAME" --format '{{.State.Running}}' 2>/dev/null | grep -q true; then
+# Verify container actually started. Retry up to 3 times with 0.5s delay —
+# docker run -d returns before the container reaches Running state on slow hosts.
+STARTED=false
+for attempt in 1 2 3; do
+    if docker inspect "$CONTAINER_NAME" --format '{{.State.Running}}' 2>/dev/null | grep -q true; then
+        STARTED=true
+        break
+    fi
+    [ "$attempt" -lt 3 ] && sleep 0.5
+done
+if [ "$STARTED" = false ]; then
     echo "ERROR: Container failed to start. Check docker logs." >&2
     docker logs "$CONTAINER_NAME" 2>&1 | tail -20 >&2
     exit 1
@@ -163,8 +212,10 @@ for i in $(seq 1 120); do
         docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
         exit 1
     }
-    # POSIX grep (no -P PCRE — not available on macOS/Alpine)
-    URL=$(docker logs "$CONTAINER_NAME" 2>&1 | grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' | head -1 || true)
+    # POSIX grep (no -P PCRE — not available on macOS/Alpine).
+    # Pattern handles single-label subdomains (abc-123.trycloudflare.com) and
+    # future multi-level subdomains (a.b.trycloudflare.com) if Cloudflare changes format.
+    URL=$(docker logs "$CONTAINER_NAME" 2>&1 | grep -o 'https://[a-z0-9.-]*\.trycloudflare\.com' | head -1 || true)
     [ -n "$URL" ] && break
 done
 
@@ -177,18 +228,20 @@ fi
 # --- Print URL and exit ---
 echo "$URL"
 
-# File listing to stderr
+# Info output to stderr (keeps stdout clean: just the URL)
 {
     echo ""
-    echo "Serving ${#FILES[@]} file(s) — expires in ${TTL}:"
+    echo "[INFO] Serving ${#FILES[@]} file(s) — expires in ${TTL}:"
     for f in "${FILES[@]}"; do
         name=$(basename "$f")
-        echo "  $URL/$name"
+        echo "[INFO]   $URL/$name"
     done
     echo ""
-    echo "Auto-shutdown in ${TTL} (${SECS}s). Manual kill: docker rm -f $CONTAINER_NAME"
+    echo "[INFO] Auto-shutdown in ${TTL} (${SECS}s). Manual kill: docker rm -f $CONTAINER_NAME"
 
     # Background cleanup: wait for container to exit, then remove serve dir.
-    # Timeout guards against containers killed externally (zombie wait).
-    (timeout 7200 docker wait "$CONTAINER_NAME" >/dev/null 2>&1; rm -rf "$SERVE_DIR") &
+    # Timeout scales with TTL + 120s buffer (minimum 60s) to avoid zombie processes.
+    WAIT_TIMEOUT=$((SECS + 120))
+    [ "$WAIT_TIMEOUT" -lt 60 ] && WAIT_TIMEOUT=60
+    (timeout "$WAIT_TIMEOUT" docker wait "$CONTAINER_NAME" >/dev/null 2>&1; rm -rf "$SERVE_DIR") &
 } >&2

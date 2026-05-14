@@ -1,7 +1,7 @@
 ---
 name: cloudflared-file-server
 description: Serve files via Cloudflare Quick Tunnel — no account, auto-expiry. Single caddy:alpine container downloads cloudflared on the fly.
-version: 3.1.0
+version: 3.2.0
 author: Hermes Agent
 license: MIT
 metadata:
@@ -43,7 +43,7 @@ Single container, no Docker network, no pre-built image. Caddy comes from `caddy
 ## Automated Serve Script
 
 ```bash
-sudo cp scripts/serve /usr/local/bin/cloudflared-serve
+sudo cp serve /usr/local/bin/cloudflared-serve
 sudo chmod +x /usr/local/bin/cloudflared-serve
 ```
 
@@ -52,7 +52,7 @@ Usage:
 cloudflared-serve <ttl> <file1> [file2 ...]
 ```
 
-TTL is the **first** argument: `30s`, `5m`, `1h`. Files follow.
+TTL is the **first** argument: `30s`, `5m`, `1h`. Minimum 10 seconds. Files follow.
 
 ```bash
 cloudflared-serve 5m cat.png dog.png parrot.png
@@ -76,7 +76,15 @@ ln /path/to/files/* "$SERVE_DIR/" 2>/dev/null || cp /path/to/files/* "$SERVE_DIR
 cat > /tmp/cf-entrypoint.sh <<'EOF'
 #!/bin/sh
 set -e
-apk add --no-cache curl >/dev/null 2>&1
+
+# Graceful shutdown on SIGTERM (docker stop)
+cleanup() { kill %1 %2 2>/dev/null || true; wait 2>/dev/null || true; }
+trap cleanup TERM INT
+
+# Install curl or wget for cloudflared download
+if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
+    apk add --no-cache curl >/dev/null 2>&1 || apk add --no-cache wget >/dev/null 2>&1
+fi
 ARCH=$(uname -m)
 case "$ARCH" in
   x86_64)  CF_ARCH="amd64" ;;
@@ -84,8 +92,18 @@ case "$ARCH" in
   armv7l)  CF_ARCH="arm" ;;
   *)       echo "ERROR: unsupported arch: $ARCH" >&2; exit 1 ;;
 esac
-curl -fsSL --connect-timeout 10 --max-time 300 \
-    "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${CF_ARCH}" -o /usr/local/bin/cloudflared
+# Version pinning: set CLOUDFLARED_VERSION env var (default: latest)
+CLOUDFLARED_VERSION="${CLOUDFLARED_VERSION:-latest}"
+if [ "$CLOUDFLARED_VERSION" = "latest" ]; then
+    CLOUDFLARED_URL="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${CF_ARCH}"
+else
+    CLOUDFLARED_URL="https://github.com/cloudflare/cloudflared/releases/download/${CLOUDFLARED_VERSION}/cloudflared-linux-${CF_ARCH}"
+fi
+if command -v curl >/dev/null 2>&1; then
+    curl -fsSL --connect-timeout 10 --max-time 300 "$CLOUDFLARED_URL" -o /usr/local/bin/cloudflared
+else
+    wget -q --timeout=10 --tries=3 "$CLOUDFLARED_URL" -O /usr/local/bin/cloudflared
+fi
 chmod +x /usr/local/bin/cloudflared
 cd /serve
 caddy file-server --listen :80 &
@@ -104,19 +122,22 @@ docker run -d --name "$CONTAINER_NAME" \
   -v "$SERVE_DIR:/serve:ro" \
   -v /tmp/cf-entrypoint.sh:/entrypoint.sh:ro \
   -e SECS=300 \
+  -e CLOUDFLARED_VERSION="${CLOUDFLARED_VERSION:-latest}" \
   --entrypoint sh \
   caddy:alpine /entrypoint.sh
 
 # 3. Get URL (poll until Cloudflare registration completes)
 for i in $(seq 1 60); do
   sleep 1
-  URL=$(docker logs "$CONTAINER_NAME" 2>&1 | grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' | head -1 || true)
+  URL=$(docker logs "$CONTAINER_NAME" 2>&1 | grep -o 'https://[a-z0-9.-]*\.trycloudflare\.com' | head -1 || true)
   [ -n "$URL" ] && break
 done
 echo "$URL"
 
-# 4. Background cleanup: remove serve dir after container exits
-(timeout 7200 docker wait "$CONTAINER_NAME" >/dev/null 2>&1; rm -rf "$SERVE_DIR") &
+# 4. Background cleanup: remove serve dir after container exits.
+#    Timeout scales with TTL (SECS + 120s) to avoid zombie processes.
+WAIT_TIMEOUT=$((300 + 120))
+(timeout "$WAIT_TIMEOUT" docker wait "$CONTAINER_NAME" >/dev/null 2>&1; rm -rf "$SERVE_DIR") &
 ```
 
 ## Adding Files While Running
@@ -163,15 +184,25 @@ docker rm -f cf-serve-$$
 
 **Serve directory auto-cleaned.** A background process waits for the container to exit (`docker wait`), then removes the serve directory. No leftover temp files.
 
-**File changes use hard links by default.** `ln` creates a hard link — same inode, zero extra disk space. Falls back to `cp` if cross-device; a warning is printed for directories when this happens.
-
-**TTL validation rejects non-numeric input.** Values like `abcm` or bare `m` are caught before the container starts, avoiding a silent zero-second expiry.
-
-**`docker run` exit is verified with `docker inspect`.** `docker run -d` can return 0 even on image pull failure. The script checks `State.Running` after launch to confirm the container is actually up.
+**File changes use hard links by default.** `ln` creates a hard link — same inode, zero extra disk space. Falls back to `cp` if cross-device; a warning is printed for both files and directories when this happens.
 
 **Error-path cleanup via EXIT trap.** If the script exits before the container starts (bad TTL, missing files), the serve directory and temp files are removed. Once the container is running, deferred cleanup takes over — the trap won't double-free.
 
-**`docker wait` has a 2-hour timeout guard.** Prevents zombie background processes if the container is killed externally.
+**`docker wait` timeout scales with TTL.** Timeout = SECS + 120s (minimum 60s). Prevents zombie background processes without wasting resources on short-lived tunnels.
+
+**Minimum TTL enforced (10 seconds).** `0s`, `0m`, `0h` are rejected — a zero-second expiry kills the container before the tunnel URL is served. The validation also rejects non-numeric values like `abcm`.
+
+**Container startup verified with retry.** `docker run -d` returns before the container reaches `Running` state on slow hosts. The script retries `docker inspect` up to 3 times with a 0.5s delay to avoid false failures.
+
+**Cloudflared version pinning works.** Set `CLOUDFLARED_VERSION=2025.2.1` to pin a specific release. Default is `latest`. The variable is passed into the container as `-e CLOUDFLARED_VERSION` and the entrypoint constructs the correct GitHub URL (`releases/latest/download/` vs `releases/download/<tag>/`).
+
+**SIGTERM handled in entrypoint.** A `trap cleanup TERM INT` forwards `docker stop` signals to Caddy and cloudflared, avoiding the 10-second Docker SIGKILL timeout.
+
+**`curl` with `wget` fallback.** If `caddy:alpine` doesn't have `curl` pre-installed, the entrypoint tries `wget` as a fallback. Both are tried before attempting `apk add`.
+
+**Network isolation not enforced.** The container needs outbound access for cloudflared tunnel (UDP 7844). Caddy listens on port 80 inside the container but is NOT published with `-p` — only accessible via the tunnel. No `--network=none` is applied because it would break the tunnel.
+
+**`stderr` output uses `[INFO]` prefix.** Informational messages (file listing, shutdown instructions) are prefixed with `[INFO]` to distinguish from `ERROR:` messages on `stderr`.
 
 **POSIX `grep -o` used for URL extraction.** No `-P` (PCRE) dependency — works on macOS, Alpine, and any system without GNU grep.
 
