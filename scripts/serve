@@ -66,56 +66,53 @@ done
 # --- Cleanup old container ---
 docker rm -f cf-serve 2>/dev/null || true
 
-# --- Start alpine container (detached, auto-remove on exit) ---
-docker run -d --rm --name cf-serve \
-    -v "$SERVE_DIR:/serve:ro" \
-    -e TTL="$SECS" \
-    alpine:latest \
-    sh -c '
+# --- Write entrypoint script (avoids & in docker run command) ---
+ENTRYPOINT="/tmp/cf-serve-entrypoint-$$.sh"
+cat > "$ENTRYPOINT" <<'ENTRYEOF'
+#!/bin/sh
 set -e
 apk add --no-cache curl >/dev/null 2>&1
-
-# Download caddy (~35MB, 5m timeout)
 curl -fsSL --connect-timeout 10 --max-time 300 \
     "https://caddyserver.com/api/download?os=linux&arch=amd64" -o /usr/local/bin/caddy
 chmod +x /usr/local/bin/caddy
-
-# Download cloudflared (~25MB, 5m timeout)
 curl -fsSL --connect-timeout 10 --max-time 300 \
     "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64" -o /usr/local/bin/cloudflared
 chmod +x /usr/local/bin/cloudflared
-
-# Start Caddy file server in background
 cd /serve
+(sleep "$TTL"; kill -9 $$ 2>/dev/null) &
 caddy file-server --listen :80 &
-CADDY_PID=$!
-
-# Auto-kill timer (runs asynchronously, does not block anything)
-(
-    sleep "$TTL"
-    kill $CADDY_PID 2>/dev/null
-    kill $$ 2>/dev/null
-    sleep 1
-    kill -9 $CADDY_PID 2>/dev/null
-    kill -9 $$ 2>/dev/null
-) &
-
-# Wait for Caddy to be ready
 sleep 1
-
-# Start cloudflared tunnel (foreground — keeps container alive)
 exec cloudflared tunnel --url http://localhost:80
-'
+ENTRYEOF
+chmod +x "$ENTRYPOINT"
 
-if [ $? -ne 0 ]; then
+# --- Start alpine container (detached, auto-remove on exit) ---
+docker run -d --rm --name cf-serve \
+    -v "$SERVE_DIR:/serve:ro" \
+    -v "$ENTRYPOINT:/entrypoint.sh:ro" \
+    -e TTL="$SECS" \
+    alpine:latest sh /entrypoint.sh
+CONTAINER_EXIT=$?
+
+# Remove temp entrypoint immediately (mounted, inode stays until container exits)
+rm -f "$ENTRYPOINT"
+
+if [ "$CONTAINER_EXIT" -ne 0 ]; then
     echo "ERROR: Failed to start container" >&2
     exit 1
 fi
 
-# --- Poll for tunnel URL (script blocks here, but container runs async) ---
+# --- Poll for tunnel URL ---
 URL=""
-for i in $(seq 1 120); do
+for i in $(seq 1 180); do
     sleep 1
+    # Check if container still exists
+    docker inspect cf-serve --format '{{.State.Running}}' 2>/dev/null | grep -q true || {
+        echo "ERROR: Container died before tunnel came up" >&2
+        docker logs cf-serve 2>&1 | tail -20 >&2
+        docker rm -f cf-serve 2>/dev/null || true
+        exit 1
+    }
     URL=$(docker logs cf-serve 2>&1 | grep -oP 'https://[-a-z0-9]+\.trycloudflare\.com' | head -1 || true)
     [ -n "$URL" ] && break
 done
@@ -126,10 +123,10 @@ if [ -z "$URL" ]; then
     exit 1
 fi
 
-# --- Script resolves here: print URL and exit ---
+# --- Print URL and exit ---
 echo "$URL"
 
-# File listing to stderr (informational, does not affect URL output)
+# File listing to stderr
 {
     echo ""
     echo "Serving ${#FILES[@]} file(s) — expires in ${TTL}:"
