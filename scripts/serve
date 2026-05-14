@@ -172,8 +172,7 @@ done
 [ -z "$URL" ] && { echo "ERROR: Failed to get tunnel URL" >&2; docker rm -f "$CONTAINER_NAME" 2>/dev/null || true; exit 1; }
 
 # --- Output ---
-# stdout: one URL per file, first line = base tunnel URL
-echo "$URL"
+# stdout: one URL per file
 for f in "${FILES[@]}"; do
     echo "$URL/$(basename "$f")"
 done
