@@ -38,7 +38,7 @@ docker logs cf-tunnel 2>&1 | grep -oP 'https://[a-z0-9-]+\.trycloudflare\.com'
 ## Adding Files While Running
 
 ```bash
-cp newfile.png /tmp/cloudflare-serve/
+ln newfile.png /tmp/cloudflare-serve/ 2>/dev/null || cp newfile.png /tmp/cloudflare-serve/
 # Immediately available at https://xxx.trycloudflare.com/newfile.png
 ```
 

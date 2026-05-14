@@ -65,10 +65,10 @@ The script prints the tunnel URL to stdout and exits immediately. Files are serv
 If the script isn't installed, use these exact commands. They are proven working.
 
 ```bash
-# 0. Prepare files
+# 0. Prepare files (hard links = zero extra disk space)
 SERVE_DIR=/tmp/cloudflare-serve
 mkdir -p "$SERVE_DIR"
-cp /path/to/files/* "$SERVE_DIR/"
+ln /path/to/files/* "$SERVE_DIR/" 2>/dev/null || cp /path/to/files/* "$SERVE_DIR/"
 
 # 1. Pull images (one-time)
 docker pull nginx:alpine cloudflare/cloudflared:latest docker:cli
@@ -100,7 +100,7 @@ docker logs cf-tunnel 2>&1 | grep -oP 'https://[a-z0-9-]+\.trycloudflare\.com'
 ## Adding Files While Running
 
 ```bash
-cp newfile.png /tmp/cloudflare-serve/
+ln newfile.png /tmp/cloudflare-serve/ 2>/dev/null || cp newfile.png /tmp/cloudflare-serve/
 # Immediately available at https://xxx.trycloudflare.com/newfile.png
 ```
 
@@ -133,7 +133,7 @@ docker network rm cf-serve
 - No SSE, no WebSocket support
 - No SLA — dev/testing only, not production
 - Subject to Cloudflare Terms of Service
-- File changes require copying into the mounted directory; symlinks don't cross Docker volume boundaries
+- File changes use hard links by default — zero disk overhead. Falls back to copy if cross-device.
 
 ## Pitfalls
 
@@ -147,7 +147,7 @@ docker network rm cf-serve
 
 **Firewall must allow outbound QUIC.** cloudflared connects to Cloudflare edge on UDP port 7844. If outbound UDP is blocked, the tunnel won't establish.
 
-**Symlinks don't work across volume mounts.** Always `cp` files into the serve directory; don't `ln -s`.
+**Use hard links, not copies.** `ln` creates a hard link — same inode, zero extra disk space. The script does this automatically with fallback to `cp` if cross-device. Large files or many files are no problem.
 
 ## Installation into Hermes
 

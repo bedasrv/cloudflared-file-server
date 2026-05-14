@@ -60,14 +60,24 @@ case "$TTL" in
 esac
 
 # --- Prepare serve directory ---
+# Use hard links to avoid duplicating disk space. Falls back to copy if across filesystems.
 SERVE_DIR="/tmp/cloudflare-serve-$$"
 mkdir -p "$SERVE_DIR"
 
 for f in "${FILES[@]}"; do
+    name=$(basename "$f")
     if [ -d "$f" ]; then
-        cp -r "$f" "$SERVE_DIR/$(basename "$f")"
+        # cp -rl = recursive hard-link (same inode, zero extra space)
+        if ! cp -rl "$f" "$SERVE_DIR/$name" 2>/dev/null; then
+            echo "WARNING: hard-link failed (cross-device?), falling back to copy: $f" >&2
+            cp -r "$f" "$SERVE_DIR/$name"
+        fi
     else
-        cp "$f" "$SERVE_DIR/$(basename "$f")"
+        # ln = hard link (same inode, zero extra space)
+        if ! ln "$f" "$SERVE_DIR/$name" 2>/dev/null; then
+            echo "WARNING: hard-link failed (cross-device?), falling back to copy: $f" >&2
+            cp "$f" "$SERVE_DIR/$name"
+        fi
     fi
 done
 
