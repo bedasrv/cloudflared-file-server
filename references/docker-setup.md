@@ -22,7 +22,8 @@ docker pull nginx:alpine cloudflare/cloudflared:latest docker:cli
 # Serve files
 SERVE_DIR=/tmp/cloudflare-serve
 mkdir -p "$SERVE_DIR"
-cp /path/to/files/* "$SERVE_DIR/"
+# Hard links — zero extra disk space. Falls back to cp if cross-device.
+ln /path/to/files/* "$SERVE_DIR/" 2>/dev/null || cp /path/to/files/* "$SERVE_DIR/"
 
 docker network create cf-serve
 docker run -d --name cf-nginx --network cf-serve -v "$SERVE_DIR:/usr/share/nginx/html:ro" nginx:alpine
@@ -32,7 +33,7 @@ docker run -d --rm --name cf-timer -v /var/run/docker.sock:/var/run/docker.sock 
 
 # Get URL
 sleep 5
-docker logs cf-tunnel 2>&1 | grep -oP 'https://[a-z0-9-]+\.trycloudflare\.com'
+docker logs cf-tunnel 2>&1 | grep -oP 'https://[-a-z0-9]+\.trycloudflare\.com'
 ```
 
 ## Adding Files While Running

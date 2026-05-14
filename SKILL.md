@@ -94,7 +94,7 @@ docker run -d --rm --name cf-timer \
 
 # 6. Get URL (wait ~5s for Cloudflare registration)
 sleep 5
-docker logs cf-tunnel 2>&1 | grep -oP 'https://[a-z0-9-]+\.trycloudflare\.com'
+docker logs cf-tunnel 2>&1 | grep -oP 'https://[-a-z0-9]+\.trycloudflare\.com'
 ```
 
 ## Adding Files While Running

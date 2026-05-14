@@ -60,7 +60,7 @@ cloudflared-serve cat.png dog.png parrot.png 2m
 ```
 
 The script:
-1. Copies files into a temp serve directory
+1. Hard-links files into a temp serve directory (zero extra disk space)
 2. Starts nginx container (serves files)
 3. Starts cloudflared container (creates tunnel)
 4. Starts timer container (auto-shutdown after TTL)
@@ -83,7 +83,7 @@ Three containers, one network. The timer container mounts the Docker socket and 
 ```bash
 SERVE_DIR=/tmp/cloudflare-serve
 mkdir -p "$SERVE_DIR"
-cp /path/to/files/* "$SERVE_DIR/"
+ln /path/to/files/* "$SERVE_DIR/" 2>/dev/null || cp /path/to/files/* "$SERVE_DIR/"
 
 docker network create cf-serve
 docker run -d --name cf-nginx --network cf-serve -v "$SERVE_DIR:/usr/share/nginx/html:ro" nginx:alpine
@@ -92,7 +92,7 @@ docker run -d --rm --name cf-timer -v /var/run/docker.sock:/var/run/docker.sock 
   sh -c "sleep 300 && docker rm -f cf-tunnel cf-nginx && docker network rm cf-serve"
 
 sleep 5
-docker logs cf-tunnel 2>&1 | grep -oP 'https://[a-z0-9-]+\.trycloudflare\.com'
+docker logs cf-tunnel 2>&1 | grep -oP 'https://[-a-z0-9]+\.trycloudflare\.com'
 ```
 
 See `references/docker-setup.md` for detailed docs.
@@ -109,7 +109,7 @@ The timer auto-kills everything after TTL. `docker:cli` container self-destructs
 - No SSE, no WebSocket
 - No SLA — dev/testing only
 - Cloudflare ToS applies
-- Symlinks don't cross Docker volume boundaries (use `cp`, not `ln -s`)
+- Uses hard links by default — zero extra disk space. Falls back to copy if files are on a different filesystem.
 
 ## License
 
