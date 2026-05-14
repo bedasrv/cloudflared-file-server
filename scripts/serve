@@ -79,10 +79,13 @@ curl -fsSL --connect-timeout 10 --max-time 300 \
     "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64" -o /usr/local/bin/cloudflared
 chmod +x /usr/local/bin/cloudflared
 cd /serve
-(sleep "$TTL"; kill -9 $$ 2>/dev/null) &
 caddy file-server --listen :80 &
 sleep 1
-exec cloudflared tunnel --url http://localhost:80
+cloudflared tunnel --url http://localhost:80 &
+CF_PID=$!
+# Timer starts AFTER both processes are running
+(sleep "$TTL"; kill $CF_PID 2>/dev/null) &
+wait $CF_PID
 ENTRYEOF
 chmod +x "$ENTRYPOINT"
 
