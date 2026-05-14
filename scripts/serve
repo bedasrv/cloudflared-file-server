@@ -63,6 +63,9 @@ for f in "${FILES[@]}"; do
     fi
 done
 
+# --- Cleanup old stale serve dirs from crashed runs ---
+find /tmp -maxdepth 1 -name 'cloudflare-serve-*' -type d -mmin +30 -exec rm -rf {} + 2>/dev/null || true
+
 # --- Cleanup old container ---
 docker rm -f cf-serve 2>/dev/null || true
 
@@ -145,4 +148,7 @@ echo "$URL"
     done
     echo ""
     echo "Auto-shutdown in ${TTL} (${SECS}s). Manual kill: docker rm -f cf-serve"
+
+    # Background cleanup: wait for container to exit, then remove serve dir
+    (docker wait cf-serve >/dev/null 2>&1; rm -rf "$SERVE_DIR") &
 } >&2
