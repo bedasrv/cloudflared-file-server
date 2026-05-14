@@ -1,6 +1,6 @@
 ---
 name: cloudflared-file-server
-description: Serve files via Cloudflare Quick Tunnel — no account, auto-expiry. Single caddy:alpine container downloads cloudflared on the fly.
+description: Serve files via Cloudflare Quick Tunnel — no account, auto-expiry. Single caddy:alpine container, cloudflared cached on host.
 version: 3.3.0
 author: Hermes Agent
 license: MIT
@@ -60,51 +60,37 @@ cloudflared-serve 30s image.png
 cloudflared-serve 1h ./downloads/
 ```
 
-The script prints the tunnel URL to stdout and exits immediately. Container runs in background, self-destructs after TTL, serve directory cleaned up automatically.
+The script prints one URL per file to stdout and exits immediately. Info/errors go to stderr with `[INFO]`/`ERROR:` prefixes. Container runs in background, self-destructs after TTL, serve directory cleaned up automatically.
+
+Example stdout:
+```
+https://xxx.trycloudflare.com/cat.png
+https://xxx.trycloudflare.com/dog.png
+```
 
 ## Manual Docker Recipe
 
 If the script isn't installed, use these exact commands. They are proven working.
 
 ```bash
-# 0. Prepare files (hard links = zero extra disk space)
+# 0. Download cloudflared once (cached at /tmp/cloudflared-cache/)
+CLOUDFLARED_CACHED="/tmp/cloudflared-cache/cloudflared-latest-$(uname -m)"
+if [ ! -x "$CLOUDFLARED_CACHED" ]; then
+    curl -fsSL "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64" -o "$CLOUDFLARED_CACHED"
+    chmod +x "$CLOUDFLARED_CACHED"
+fi
+
+# 1. Prepare serve dir (hard links = zero extra disk space)
 SERVE_DIR=/tmp/cloudflare-serve-$$
 mkdir -p "$SERVE_DIR"
 ln /path/to/files/* "$SERVE_DIR/" 2>/dev/null || cp /path/to/files/* "$SERVE_DIR/"
 
-# 1. Write entrypoint script (avoids issues with caddy:alpine's ENTRYPOINT)
+# 2. Write entrypoint
 cat > /tmp/cf-entrypoint.sh <<'EOF'
 #!/bin/sh
 set -e
-
-# Graceful shutdown on SIGTERM (docker stop)
 cleanup() { kill %1 %2 2>/dev/null || true; wait 2>/dev/null || true; }
 trap cleanup TERM INT
-
-# Install curl or wget for cloudflared download
-if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
-    apk add --no-cache curl >/dev/null 2>&1 || apk add --no-cache wget >/dev/null 2>&1
-fi
-ARCH=$(uname -m)
-case "$ARCH" in
-  x86_64)  CF_ARCH="amd64" ;;
-  aarch64) CF_ARCH="arm64" ;;
-  armv7l)  CF_ARCH="arm" ;;
-  *)       echo "ERROR: unsupported arch: $ARCH" >&2; exit 1 ;;
-esac
-# Version pinning: set CLOUDFLARED_VERSION env var (default: latest)
-CLOUDFLARED_VERSION="${CLOUDFLARED_VERSION:-latest}"
-if [ "$CLOUDFLARED_VERSION" = "latest" ]; then
-    CLOUDFLARED_URL="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${CF_ARCH}"
-else
-    CLOUDFLARED_URL="https://github.com/cloudflare/cloudflared/releases/download/${CLOUDFLARED_VERSION}/cloudflared-linux-${CF_ARCH}"
-fi
-if command -v curl >/dev/null 2>&1; then
-    curl -fsSL --connect-timeout 10 --max-time 300 "$CLOUDFLARED_URL" -o /usr/local/bin/cloudflared
-else
-    wget -q --timeout=10 --tries=3 "$CLOUDFLARED_URL" -O /usr/local/bin/cloudflared
-fi
-chmod +x /usr/local/bin/cloudflared
 cd /serve
 caddy file-server --listen :80 &
 sleep 1
@@ -115,27 +101,25 @@ wait $CF_PID
 EOF
 chmod +x /tmp/cf-entrypoint.sh
 
-# 2. Start container (--entrypoint sh required because caddy:alpine has ENTRYPOINT ["caddy"])
-#    Container name uses $$ (shell PID) to allow concurrent instances.
+# 3. Start container (mount cached cloudflared, skip download)
 CONTAINER_NAME="cf-serve-$$"
 docker run -d --name "$CONTAINER_NAME" \
   -v "$SERVE_DIR:/serve:ro" \
   -v /tmp/cf-entrypoint.sh:/entrypoint.sh:ro \
+  -v "$CLOUDFLARED_CACHED:/usr/local/bin/cloudflared:ro" \
   -e SECS=300 \
-  -e CLOUDFLARED_VERSION="${CLOUDFLARED_VERSION:-latest}" \
   --entrypoint sh \
   caddy:alpine /entrypoint.sh
 
-# 3. Get URL (poll until Cloudflare registration completes)
+# 4. Get URL
 for i in $(seq 1 60); do
   sleep 1
   URL=$(docker logs "$CONTAINER_NAME" 2>&1 | grep -o 'https://[a-z0-9.-]*\.trycloudflare\.com' | head -1 || true)
   [ -n "$URL" ] && break
 done
-echo "$URL"
+echo "$URL/$(ls "$SERVE_DIR" | head -1)"
 
-# 4. Background cleanup: remove serve dir after container exits.
-#    Timeout scales with TTL (SECS + 120s) to avoid zombie processes.
+# 5. Cleanup after container exits
 WAIT_TIMEOUT=$((300 + 120))
 (timeout "$WAIT_TIMEOUT" docker wait "$CONTAINER_NAME" >/dev/null 2>&1; rm -rf "$SERVE_DIR") &
 ```
@@ -165,8 +149,7 @@ docker rm -f cf-serve-$$
 - No SSE, no WebSocket support
 - No SLA — dev/testing only, not production
 - Subject to Cloudflare Terms of Service
-- First run downloads ~25MB (cloudflared binary only; caddy is pre-installed in base image)
-- Downloads happen per-invocation (no image caching)
+- First run downloads ~25MB (cloudflared binary, cached on host for 24h)
 
 ## Pitfalls
 
