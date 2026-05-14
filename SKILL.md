@@ -1,7 +1,7 @@
 ---
 name: cloudflared-file-server
 description: Serve files via Cloudflare Quick Tunnel — no account, auto-expiry. Single caddy:alpine container downloads cloudflared on the fly.
-version: 3.0.1
+version: 3.1.0
 author: Hermes Agent
 license: MIT
 metadata:
@@ -68,7 +68,7 @@ If the script isn't installed, use these exact commands. They are proven working
 
 ```bash
 # 0. Prepare files (hard links = zero extra disk space)
-SERVE_DIR=/tmp/cloudflare-serve
+SERVE_DIR=/tmp/cloudflare-serve-$$
 mkdir -p "$SERVE_DIR"
 ln /path/to/files/* "$SERVE_DIR/" 2>/dev/null || cp /path/to/files/* "$SERVE_DIR/"
 
@@ -92,29 +92,31 @@ caddy file-server --listen :80 &
 sleep 1
 cloudflared tunnel --url http://localhost:80 &
 CF_PID=$!
-(sleep "$TTL"; kill $CF_PID 2>/dev/null) &
+(sleep "$SECS"; kill $CF_PID 2>/dev/null) &
 wait $CF_PID
 EOF
 chmod +x /tmp/cf-entrypoint.sh
 
 # 2. Start container (--entrypoint sh required because caddy:alpine has ENTRYPOINT ["caddy"])
-docker run -d --name cf-serve \
+#    Container name uses $$ (shell PID) to allow concurrent instances.
+CONTAINER_NAME="cf-serve-$$"
+docker run -d --name "$CONTAINER_NAME" \
   -v "$SERVE_DIR:/serve:ro" \
   -v /tmp/cf-entrypoint.sh:/entrypoint.sh:ro \
-  -e TTL=300 \
+  -e SECS=300 \
   --entrypoint sh \
   caddy:alpine /entrypoint.sh
 
 # 3. Get URL (poll until Cloudflare registration completes)
 for i in $(seq 1 60); do
   sleep 1
-  URL=$(docker logs cf-serve 2>&1 | grep -oP 'https://[-a-z0-9]+\.trycloudflare\.com' | head -1 || true)
+  URL=$(docker logs "$CONTAINER_NAME" 2>&1 | grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' | head -1 || true)
   [ -n "$URL" ] && break
 done
 echo "$URL"
 
 # 4. Background cleanup: remove serve dir after container exits
-(docker wait cf-serve >/dev/null 2>&1; rm -rf "$SERVE_DIR") &
+(timeout 7200 docker wait "$CONTAINER_NAME" >/dev/null 2>&1; rm -rf "$SERVE_DIR") &
 ```
 
 ## Adding Files While Running
@@ -133,7 +135,7 @@ curl -sI "https://TUNNEL.trycloudflare.com/filename"
 ## Tear Down
 
 ```bash
-docker rm -f cf-serve
+docker rm -f cf-serve-$$
 ```
 
 ## Limitations
@@ -147,7 +149,7 @@ docker rm -f cf-serve
 
 ## Pitfalls
 
-**Container name (`cf-serve`) is hardcoded.** Old instances are cleaned up at script start. If you run manually, remove old ones first.
+**Container name uses `$$` (PID) suffix (`cf-serve-$$`).** This allows concurrent instances without collision. Old instances with the same PID are cleaned up at script start. Stale named containers from old PIDs can accumulate — the script cleans them on next run.
 
 **`caddy:alpine` has `ENTRYPOINT ["caddy"]`.** Always use `--entrypoint sh` when running the container with a custom entrypoint script, otherwise Caddy tries to interpret `sh` as a subcommand and fails.
 
@@ -161,9 +163,19 @@ docker rm -f cf-serve
 
 **Serve directory auto-cleaned.** A background process waits for the container to exit (`docker wait`), then removes the serve directory. No leftover temp files.
 
-**File changes use hard links by default.** `ln` creates a hard link — same inode, zero extra disk space. Falls back to `cp` if cross-device.
+**File changes use hard links by default.** `ln` creates a hard link — same inode, zero extra disk space. Falls back to `cp` if cross-device; a warning is printed for directories when this happens.
 
-**Local DNS may block trycloudflare.com.** The tunnel is still up — verify by checking `docker logs cf-serve` instead of curl.
+**TTL validation rejects non-numeric input.** Values like `abcm` or bare `m` are caught before the container starts, avoiding a silent zero-second expiry.
+
+**`docker run` exit is verified with `docker inspect`.** `docker run -d` can return 0 even on image pull failure. The script checks `State.Running` after launch to confirm the container is actually up.
+
+**Error-path cleanup via EXIT trap.** If the script exits before the container starts (bad TTL, missing files), the serve directory and temp files are removed. Once the container is running, deferred cleanup takes over — the trap won't double-free.
+
+**`docker wait` has a 2-hour timeout guard.** Prevents zombie background processes if the container is killed externally.
+
+**POSIX `grep -o` used for URL extraction.** No `-P` (PCRE) dependency — works on macOS, Alpine, and any system without GNU grep.
+
+**Local DNS may block trycloudflare.com.** The tunnel is still up — verify by checking `docker logs cf-serve-$$` instead of curl.
 
 **Firewall must allow outbound QUIC.** cloudflared connects to Cloudflare edge on UDP port 7844.
 

@@ -3,7 +3,13 @@
 # Spins up caddy:alpine, downloads cloudflared, serves files, self-destructs.
 # Usage: cloudflared-serve <ttl> <file1> [file2 ...]
 # TTL format: 30s, 5m, 1h
-set -u
+
+# To pin cloudflared to a specific version, set CLOUDFLARED_VERSION before
+# running (the download URL inside the container uses 'latest' by default):
+#   CLOUDFLARED_VERSION=2025.2.1 cloudflared-serve 5m file.txt
+# This is passed as an env var into the container; edit the URL in the
+# entrypoint heredoc below to switch from 'latest' to a pinned release tag.
+set -euo pipefail
 
 usage() {
     cat >&2 <<'EOF'
@@ -37,6 +43,9 @@ case "$TTL" in
     *)  echo "ERROR: Invalid TTL: $TTL (use 30s, 5m, 1h)" >&2; exit 1 ;;
 esac
 
+# Reject non-numeric (e.g. 'abcm', 'm' → arithmetic produces 0 or empty)
+[[ "$SECS" =~ ^[0-9]+$ ]] || { echo "ERROR: Invalid TTL: $TTL" >&2; exit 1; }
+
 # --- Parse files ---
 FILES=("$@")
 if [ ${#FILES[@]} -eq 0 ]; then
@@ -51,26 +60,45 @@ for f in "${FILES[@]}"; do
     fi
 done
 
-# --- Prepare serve directory (hard links = zero disk overhead) ---
+# --- Container and serve dir names ---
+CONTAINER_NAME="cf-serve-$$"
 SERVE_DIR="/tmp/cloudflare-serve-$$"
+ENTRYPOINT="/tmp/cf-serve-entrypoint-$$.sh"
+
+# Trap: clean up on error exit (only if container is NOT running).
+# Happy-path deferred cleanup is handled by the background docker wait below.
+cleanup_on_error() {
+    if ! docker inspect "$CONTAINER_NAME" --format '{{.State.Running}}' 2>/dev/null | grep -q true; then
+        docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
+        [ -d "$SERVE_DIR" ] && rm -rf "$SERVE_DIR"
+    fi
+    rm -f "$ENTRYPOINT"
+}
+trap cleanup_on_error EXIT
+
+# --- Cleanup old stale serve dirs from crashed runs ---
+find /tmp -maxdepth 1 -name 'cloudflare-serve-*' -type d -mmin +30 -exec rm -rf {} + 2>/dev/null || true
+
+# --- Prepare serve directory (hard links = zero disk overhead) ---
 mkdir -p "$SERVE_DIR"
 for f in "${FILES[@]}"; do
     name=$(basename "$f")
     if [ -d "$f" ]; then
-        cp -rl "$f" "$SERVE_DIR/$name" 2>/dev/null || cp -r "$f" "$SERVE_DIR/$name"
+        if cp -rl "$f" "$SERVE_DIR/$name" 2>/dev/null; then
+            : # hard links succeeded
+        else
+            echo "WARNING: hard links failed for '$f' (cross-device?), falling back to copy" >&2
+            cp -r "$f" "$SERVE_DIR/$name"
+        fi
     else
         ln "$f" "$SERVE_DIR/$name" 2>/dev/null || cp "$f" "$SERVE_DIR/$name"
     fi
 done
 
-# --- Cleanup old stale serve dirs from crashed runs ---
-find /tmp -maxdepth 1 -name 'cloudflare-serve-*' -type d -mmin +30 -exec rm -rf {} + 2>/dev/null || true
-
-# --- Cleanup old container ---
-docker rm -f cf-serve 2>/dev/null || true
+# --- Cleanup old container (stale from crashed run with same PID) ---
+docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
 
 # --- Write entrypoint script (avoids & in docker run command) ---
-ENTRYPOINT="/tmp/cf-serve-entrypoint-$$.sh"
 cat > "$ENTRYPOINT" <<'ENTRYEOF'
 #!/bin/sh
 set -e
@@ -83,6 +111,8 @@ case "$ARCH" in
   armv7l)  CF_ARCH="arm" ;;
   *)       echo "ERROR: unsupported architecture: $ARCH" >&2; exit 1 ;;
 esac
+# To pin a version, replace 'latest' with a release tag:
+#   releases/download/2025.2.1/cloudflared-linux-...
 curl -fsSL --connect-timeout 10 --max-time 300 \
     "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${CF_ARCH}" -o /usr/local/bin/cloudflared
 chmod +x /usr/local/bin/cloudflared
@@ -91,26 +121,34 @@ caddy file-server --listen :80 &
 sleep 1
 cloudflared tunnel --url http://localhost:80 &
 CF_PID=$!
-# Timer starts AFTER both processes are running
-(sleep "$TTL"; kill $CF_PID 2>/dev/null) &
+# Timer starts AFTER both processes are running.
+# SECS is set by the host script and passed as an env var (always in seconds).
+(sleep "$SECS"; kill $CF_PID 2>/dev/null) &
 wait $CF_PID
 ENTRYEOF
 chmod +x "$ENTRYPOINT"
 
 # --- Start container (detached) ---
-docker run -d --name cf-serve \
+docker run -d --name "$CONTAINER_NAME" \
     -v "$SERVE_DIR:/serve:ro" \
     -v "$ENTRYPOINT:/entrypoint.sh:ro" \
-    -e TTL="$SECS" \
+    -e SECS="$SECS" \
     --entrypoint sh \
     caddy:alpine /entrypoint.sh
-CONTAINER_EXIT=$?
+DOCKER_EXIT=$?
 
 # Remove temp entrypoint immediately (mounted, inode stays until container exits)
 rm -f "$ENTRYPOINT"
 
-if [ "$CONTAINER_EXIT" -ne 0 ]; then
-    echo "ERROR: Failed to start container" >&2
+if [ "$DOCKER_EXIT" -ne 0 ]; then
+    echo "ERROR: docker run failed (exit code $DOCKER_EXIT)" >&2
+    exit 1
+fi
+
+# Verify container actually started (docker run -d can succeed on image pull failure)
+if ! docker inspect "$CONTAINER_NAME" --format '{{.State.Running}}' 2>/dev/null | grep -q true; then
+    echo "ERROR: Container failed to start. Check docker logs." >&2
+    docker logs "$CONTAINER_NAME" 2>&1 | tail -20 >&2
     exit 1
 fi
 
@@ -119,19 +157,20 @@ URL=""
 for i in $(seq 1 120); do
     sleep 1
     # Check if container still exists
-    docker inspect cf-serve --format '{{.State.Running}}' 2>/dev/null | grep -q true || {
+    docker inspect "$CONTAINER_NAME" --format '{{.State.Running}}' 2>/dev/null | grep -q true || {
         echo "ERROR: Container died before tunnel came up" >&2
-        docker logs cf-serve 2>&1 | tail -20 >&2
-        docker rm -f cf-serve 2>/dev/null || true
+        docker logs "$CONTAINER_NAME" 2>&1 | tail -20 >&2
+        docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
         exit 1
     }
-    URL=$(docker logs cf-serve 2>&1 | grep -oP 'https://[-a-z0-9]+\.trycloudflare\.com' | head -1 || true)
+    # POSIX grep (no -P PCRE — not available on macOS/Alpine)
+    URL=$(docker logs "$CONTAINER_NAME" 2>&1 | grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' | head -1 || true)
     [ -n "$URL" ] && break
 done
 
 if [ -z "$URL" ]; then
-    echo "ERROR: Failed to get tunnel URL (check: docker logs cf-serve)" >&2
-    docker rm -f cf-serve 2>/dev/null || true
+    echo "ERROR: Failed to get tunnel URL (check: docker logs $CONTAINER_NAME)" >&2
+    docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
     exit 1
 fi
 
@@ -147,8 +186,9 @@ echo "$URL"
         echo "  $URL/$name"
     done
     echo ""
-    echo "Auto-shutdown in ${TTL} (${SECS}s). Manual kill: docker rm -f cf-serve"
+    echo "Auto-shutdown in ${TTL} (${SECS}s). Manual kill: docker rm -f $CONTAINER_NAME"
 
-    # Background cleanup: wait for container to exit, then remove serve dir
-    (docker wait cf-serve >/dev/null 2>&1; rm -rf "$SERVE_DIR") &
+    # Background cleanup: wait for container to exit, then remove serve dir.
+    # Timeout guards against containers killed externally (zombie wait).
+    (timeout 7200 docker wait "$CONTAINER_NAME" >/dev/null 2>&1; rm -rf "$SERVE_DIR") &
 } >&2
