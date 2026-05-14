@@ -1,0 +1,127 @@
+#!/usr/bin/env bash
+# cloudflared-serve — serve files via Cloudflare Quick Tunnel (Docker-native)
+# Usage: cloudflared-serve <file-or-dir> [ttl]
+#        cloudflared-serve <file1> <file2> ... <ttl>
+# TTL format: 30s, 5m, 1h (default: 5m)
+
+set -u
+
+# --- Usage ---
+usage() {
+    cat >&2 <<'EOF'
+Usage: cloudflared-serve <file-or-dir> [ttl]
+       cloudflared-serve <file1> <file2> ... <ttl>
+
+Serve files via temporary Cloudflare Quick Tunnel (Docker-native, no account needed).
+
+Arguments:
+  file-or-dir   Path to a file or directory to serve
+  ttl           Auto-shutdown timer: 30s, 5m, 1h (default: 5m)
+
+Examples:
+  cloudflared-serve image.png
+  cloudflared-serve ./downloads/ 10m
+  cloudflared-serve cat.png dog.png parrot.png 2m
+
+The tunnel URL is printed to stdout. Files are served until TTL expires.
+EOF
+    exit 1
+}
+
+# --- Parse arguments ---
+TTL="5m"
+FILES=()
+
+for arg in "$@"; do
+    case "$arg" in
+        -h|--help) usage ;;
+    esac
+    # If it looks like a TTL (ends in s/m/h and is a number before that), treat as TTL
+    if [[ "$arg" =~ ^[0-9]+[smh]$ ]] && [ "${#FILES[@]}" -gt 0 ]; then
+        TTL="$arg"
+    elif [ -e "$arg" ]; then
+        FILES+=("$(realpath "$arg")")
+    else
+        echo "ERROR: '$arg' is not a valid file or directory" >&2
+        exit 1
+    fi
+done
+
+if [ "${#FILES[@]}" -eq 0 ]; then
+    usage
+fi
+
+# --- Convert TTL to seconds ---
+case "$TTL" in
+    *s) SECS="${TTL%s}" ;;
+    *m) SECS=$((${TTL%m} * 60)) ;;
+    *h) SECS=$((${TTL%h} * 3600)) ;;
+    *) echo "ERROR: Invalid TTL: $TTL (use 30s, 5m, 1h)" >&2; exit 1 ;;
+esac
+
+# --- Prepare serve directory ---
+SERVE_DIR="/tmp/cloudflare-serve-$$"
+mkdir -p "$SERVE_DIR"
+
+for f in "${FILES[@]}"; do
+    if [ -d "$f" ]; then
+        cp -r "$f" "$SERVE_DIR/$(basename "$f")"
+    else
+        cp "$f" "$SERVE_DIR/$(basename "$f")"
+    fi
+done
+
+# --- Cleanup stale containers/networks ---
+docker rm -f cf-nginx cf-tunnel cf-timer 2>/dev/null || true
+docker network rm cf-serve 2>/dev/null || true
+
+# --- Pull images (silent, only if missing) ---
+docker pull nginx:alpine >/dev/null 2>&1 || true
+docker pull cloudflare/cloudflared:latest >/dev/null 2>&1 || true
+docker pull docker:cli >/dev/null 2>&1 || true
+
+# --- Create network ---
+docker network create cf-serve >/dev/null 2>&1
+
+# --- Start nginx ---
+docker run -d --name cf-nginx --network cf-serve \
+    -v "$SERVE_DIR:/usr/share/nginx/html:ro" \
+    nginx:alpine >/dev/null 2>&1
+
+# --- Start cloudflared tunnel ---
+docker run -d --name cf-tunnel --network cf-serve \
+    cloudflare/cloudflared tunnel --url http://cf-nginx:80 >/dev/null 2>&1
+
+# --- Auto-shutdown timer (pure Docker) ---
+docker run -d --rm --name cf-timer \
+    -v /var/run/docker.sock:/var/run/docker.sock \
+    docker:cli \
+    sh -c "sleep $SECS && docker rm -f cf-tunnel cf-nginx && docker network rm cf-serve" >/dev/null 2>&1
+
+# --- Wait for Cloudflare registration and extract URL ---
+URL=""
+for i in $(seq 1 20); do
+    sleep 1
+    URL=$(docker logs cf-tunnel --tail 20 2>&1 | grep -oP 'https://[-a-z0-9]+\.trycloudflare\.com' | head -1 || true)
+    [ -n "$URL" ] && break
+done
+
+if [ -z "$URL" ]; then
+    echo "ERROR: Failed to get tunnel URL. Check: docker logs cf-tunnel" >&2
+    docker rm -f cf-tunnel cf-nginx cf-timer 2>/dev/null || true
+    docker network rm cf-serve 2>/dev/null || true
+    exit 1
+fi
+
+# --- Success: print URL and file listing ---
+echo "$URL"
+
+# List all served files
+echo "" >&2
+echo "Serving ${#FILES[@]} file(s) — expires in ${TTL}:" >&2
+for f in "${FILES[@]}"; do
+    name=$(basename "$f")
+    echo "  $URL/$name" >&2
+done
+echo "" >&2
+echo "Auto-shutdown in ${TTL} (${SECS}s). Manual kill: docker rm -f cf-tunnel cf-nginx cf-timer" >&2
