@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # cloudflared-serve — non-blocking Cloudflare Quick Tunnel file server
-# Spins up alpine:latest, downloads caddy + cloudflared, serves files, self-destructs.
+# Spins up caddy:alpine, downloads cloudflared, serves files, self-destructs.
 # Usage: cloudflared-serve <ttl> <file1> [file2 ...]
 # TTL format: 30s, 5m, 1h
 set -u
@@ -72,8 +72,16 @@ cat > "$ENTRYPOINT" <<'ENTRYEOF'
 #!/bin/sh
 set -e
 apk add --no-cache curl >/dev/null 2>&1
+# Detect architecture for cloudflared download
+ARCH=$(uname -m)
+case "$ARCH" in
+  x86_64)  CF_ARCH="amd64" ;;
+  aarch64) CF_ARCH="arm64" ;;
+  armv7l)  CF_ARCH="arm" ;;
+  *)       echo "ERROR: unsupported architecture: $ARCH" >&2; exit 1 ;;
+esac
 curl -fsSL --connect-timeout 10 --max-time 300 \
-    "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64" -o /usr/local/bin/cloudflared
+    "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${CF_ARCH}" -o /usr/local/bin/cloudflared
 chmod +x /usr/local/bin/cloudflared
 cd /serve
 caddy file-server --listen :80 &
@@ -86,12 +94,13 @@ wait $CF_PID
 ENTRYEOF
 chmod +x "$ENTRYPOINT"
 
-# --- Start alpine container (detached, auto-remove on exit) ---
-docker run -d --rm --name cf-serve \
+# --- Start container (detached) ---
+docker run -d --name cf-serve \
     -v "$SERVE_DIR:/serve:ro" \
     -v "$ENTRYPOINT:/entrypoint.sh:ro" \
     -e TTL="$SECS" \
-    caddy:alpine sh /entrypoint.sh
+    --entrypoint sh \
+    caddy:alpine /entrypoint.sh
 CONTAINER_EXIT=$?
 
 # Remove temp entrypoint immediately (mounted, inode stays until container exits)
