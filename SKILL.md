@@ -1,7 +1,7 @@
 ---
 name: cloudflared-file-server
 description: Serve files via Cloudflare Quick Tunnel — no account, auto-expiry. Single caddy:alpine container downloads cloudflared on the fly.
-version: 3.2.0
+version: 3.3.0
 author: Hermes Agent
 license: MIT
 metadata:
@@ -38,7 +38,7 @@ Files on host  ──ro mount──→  caddy:alpine container
                                https://xxx.trycloudflare.com
 ```
 
-Single container, no Docker network, no pre-built image. Caddy comes from `caddy:alpine` base image. Only `cloudflared` binary (~25MB) is downloaded each run. Architecture auto-detected (amd64/arm64/arm). Serve directory removed automatically after container exits.
+Single container, no Docker network, no pre-built image. Caddy comes from `caddy:alpine` base image. Cloudflared binary (~25MB) is cached on host at `/tmp/cloudflared-cache/` (24h TTL) and mounted into containers — only the first invocation downloads, subsequent ones are instant. Architecture auto-detected (amd64/arm64/arm). Serve directory removed automatically after container exits.
 
 ## Automated Serve Script
 
@@ -176,7 +176,7 @@ docker rm -f cf-serve-$$
 
 **No `--rm` on `docker run`.** The container is NOT auto-removed so that `docker logs` and `docker inspect` remain accessible after a crash. The script cleans up stale containers on next run.
 
-**Downloads on every invocation.** Cloudflared (~25MB) is fetched fresh each run. Caddy is pre-installed in the base image. If you need faster spin-up, consider pre-building an image.
+**Cloudflared cached on host (24h).** First invocation downloads ~25MB to `/tmp/cloudflared-cache/`. Subsequent invocations mount the cached binary — no download, ~5s to tunnel URL. Cache auto-purges after 24h.
 
 **Timer starts after tunnel is up.** The auto-kill timer only begins counting after both Caddy and cloudflared are running. Downloads do not eat into the TTL.
 
