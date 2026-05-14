@@ -172,14 +172,15 @@ done
 [ -z "$URL" ] && { echo "ERROR: Failed to get tunnel URL" >&2; docker rm -f "$CONTAINER_NAME" 2>/dev/null || true; exit 1; }
 
 # --- Output ---
+# stdout: one URL per file, first line = base tunnel URL
 echo "$URL"
+for f in "${FILES[@]}"; do
+    echo "$URL/$(basename "$f")"
+done
 {
     echo ""
-    echo "[INFO] Serving ${#FILES[@]} file(s) — expires in ${TTL}:"
-    for f in "${FILES[@]}"; do
-        echo "[INFO]   $URL/$(basename "$f")"
-    done
-    echo "[INFO] Auto-shutdown in ${TTL} (${SECS}s). Manual kill: docker rm -f $CONTAINER_NAME"
+    echo "[INFO] ${#FILES[@]} file(s) — expires in ${TTL} (${SECS}s)"
+    echo "[INFO] Kill: docker rm -f $CONTAINER_NAME"
 } >&2
 
 # Background cleanup
