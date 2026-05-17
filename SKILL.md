@@ -1,7 +1,7 @@
 ---
 name: cloudflared-file-server
 description: Serve files via Cloudflare Quick Tunnel — no account, auto-expiry. Single caddy:alpine container, cloudflared cached on host.
-version: 3.3.0
+version: 3.4.0
 author: Hermes Agent
 license: MIT
 metadata:
@@ -39,6 +39,10 @@ Files on host  ──ro mount──→  caddy:alpine container
 ```
 
 Single container, no Docker network, no pre-built image. Caddy comes from `caddy:alpine` base image. Cloudflared binary (~25MB) is cached on host at `/tmp/cloudflared-cache/` (24h TTL) and mounted into containers — only the first invocation downloads, subsequent ones are instant. Architecture auto-detected (amd64/arm64/arm). Serve directory removed automatically after container exits.
+
+## Agent Behavior
+
+Run `cloudflared-serve` in **foreground** mode with a generous timeout (180s). The script blocks until the tunnel is registered (typically 3–5s, worst-case 120s), prints the URL to stdout, then exits. The Docker container keeps running in the background until TTL expires — but the script itself returns as soon as the tunnel URL is available. No need for background mode or manual log scraping.
 
 ## Automated Serve Script
 
