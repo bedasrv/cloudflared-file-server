@@ -47,7 +47,7 @@ Run `cloudflared-serve` in **foreground** mode with a generous timeout (180s). T
 ## Automated Serve Script
 
 ```bash
-sudo cp serve /usr/local/bin/cloudflared-serve
+sudo cp scripts/serve /usr/local/bin/cloudflared-serve
 sudo chmod +x /usr/local/bin/cloudflared-serve
 ```
 
@@ -64,7 +64,7 @@ cloudflared-serve 30s image.png
 cloudflared-serve 1h ./downloads/
 ```
 
-The script prints one URL per file to stdout and exits immediately. Info/errors go to stderr with `[INFO]`/`ERROR:` prefixes. Container runs in background, self-destructs after TTL, serve directory cleaned up automatically.
+The script prints one URL per file to stdout. Info/errors go to stderr with `[INFO]`/`ERROR:` prefixes. Container runs in background, self-destructs after TTL, serve directory cleaned up automatically.
 
 Example stdout:
 ```
@@ -165,7 +165,7 @@ docker rm -f cf-serve-$$
 
 **Cloudflared cached on host (24h).** First invocation downloads ~25MB to `/tmp/cloudflared-cache/`. Subsequent invocations mount the cached binary — no download, ~5s to tunnel URL. Cache auto-purges after 24h.
 
-**Timer starts after tunnel is up.** The auto-kill timer only begins counting after both Caddy and cloudflared are running. Downloads do not eat into the TTL.
+**Timer starts when cloudflared launches.** The auto-kill timer (`sleep $SECS; kill $CF_PID`) begins counting as soon as cloudflared starts, not after tunnel registration. For typical TTLs (5m+), the ~3-5s registration delay is negligible.
 
 **Architecture auto-detected.** `uname -m` selects the correct cloudflared binary: `amd64`, `arm64`, or `arm`. No hardcoded architecture assumptions.
 
@@ -181,11 +181,11 @@ docker rm -f cf-serve-$$
 
 **Container startup verified with retry.** `docker run -d` returns before the container reaches `Running` state on slow hosts. The script retries `docker inspect` up to 3 times with a 0.5s delay to avoid false failures.
 
-**Cloudflared version pinning works.** Set `CLOUDFLARED_VERSION=2025.2.1` to pin a specific release. Default is `latest`. The variable is passed into the container as `-e CLOUDFLARED_VERSION` and the entrypoint constructs the correct GitHub URL (`releases/latest/download/` vs `releases/download/<tag>/`).
+**Cloudflared version pinning works.** Set `CLOUDFLARED_VERSION=2025.2.1` to pin a specific release. Default is `latest`. The host script uses this to select which cached binary to mount — version handling is host-side, not inside the container.
 
 **SIGTERM handled in entrypoint.** A `trap cleanup TERM INT` forwards `docker stop` signals to Caddy and cloudflared, avoiding the 10-second Docker SIGKILL timeout.
 
-**`curl` with `wget` fallback.** If `caddy:alpine` doesn't have `curl` pre-installed, the entrypoint tries `wget` as a fallback. Both are tried before attempting `apk add`.
+**Download uses `curl` with `wget` fallback (host-side).** The host script tries `curl` first, then `wget`, and exits with an error if neither is available. The container entrypoint does no downloading — the cloudflared binary is mounted from the host cache.
 
 **Network isolation not enforced.** The container needs outbound access for cloudflared tunnel (UDP 7844). Caddy listens on port 80 inside the container but is NOT published with `-p` — only accessible via the tunnel. No `--network=none` is applied because it would break the tunnel.
 
