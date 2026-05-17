@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# cloudflared-serve — non-blocking Cloudflare Quick Tunnel file server
+# cloudflared-serve — Cloudflare Quick Tunnel file server (blocks until URL ready)
 # Spins up caddy:alpine, serves files, self-destructs after TTL.
 # Usage: cloudflared-serve <ttl> <file1> [file2 ...]
 # TTL format: 30s, 5m, 1h (minimum 10s)
@@ -15,7 +15,7 @@ usage() {
 Usage: cloudflared-serve <ttl> <file1> [file2 ...]
 
 Serve files via temporary Cloudflare Quick Tunnel. One tunnel serves all files.
-Script returns immediately with the URL, container self-destructs after TTL.
+Script blocks until tunnel URL is obtained, container self-destructs after TTL.
 
 Arguments:
   ttl      Auto-shutdown timer: 30s, 5m, 1h (minimum 10s)
