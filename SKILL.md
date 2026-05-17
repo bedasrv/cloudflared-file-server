@@ -47,8 +47,7 @@ Run `cloudflared-serve` in **foreground** mode with a generous timeout (180s). T
 ## Automated Serve Script
 
 ```bash
-sudo cp scripts/serve /usr/local/bin/cloudflared-serve
-sudo chmod +x /usr/local/bin/cloudflared-serve
+sudo ln -s "$(pwd)/scripts/serve" /usr/local/bin/cloudflared-serve
 ```
 
 Usage:
