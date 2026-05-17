@@ -10,7 +10,7 @@ metadata:
     category: devops
     min_hermes_version: "2.0"
     dependencies:
-      commands: [docker]
+      commands: [docker, curl]
       images: [caddy:alpine]
 ---
 
@@ -78,9 +78,21 @@ https://xxx.trycloudflare.com/dog.png
 
 ```bash
 # 0. Download cloudflared once (cached at /tmp/cloudflared-cache/)
-CLOUDFLARED_CACHED="/tmp/cloudflared-cache/cloudflared-latest-$(uname -m)"
+CLOUDFLARED_VERSION="${CLOUDFLARED_VERSION:-latest}"
+case "$(uname -m)" in
+  x86_64)  CF_ARCH="amd64" ;;
+  aarch64) CF_ARCH="arm64" ;;
+  armv7l)  CF_ARCH="arm" ;;
+  *)       echo "ERROR: unsupported arch" >&2; exit 1 ;;
+esac
+CLOUDFLARED_CACHED="/tmp/cloudflared-cache/cloudflared-${CLOUDFLARED_VERSION}-$(uname -m)"
 if [ ! -x "$CLOUDFLARED_CACHED" ]; then
-    curl -fsSL "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64" -o "$CLOUDFLARED_CACHED"
+    if [ "$CLOUDFLARED_VERSION" = "latest" ]; then
+        URL="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${CF_ARCH}"
+    else
+        URL="https://github.com/cloudflare/cloudflared/releases/download/${CLOUDFLARED_VERSION}/cloudflared-linux-${CF_ARCH}"
+    fi
+    curl -fsSL --connect-timeout 10 --max-time 300 "$URL" -o "$CLOUDFLARED_CACHED"
     chmod +x "$CLOUDFLARED_CACHED"
 fi
 
