@@ -74,7 +74,7 @@ https://xxx.trycloudflare.com/dog.png
 
 ## Manual Docker Recipe
 
-If the script isn't installed, use these exact commands. They are proven working.
+**Only use this if `cloudflared-serve` is not installed.** The script handles URL polling internally — prefer it. This recipe is the raw fallback showing what the script automates.
 
 ```bash
 # 0. Download cloudflared once (cached at /tmp/cloudflared-cache/)
