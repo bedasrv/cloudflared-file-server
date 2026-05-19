@@ -1,6 +1,6 @@
 ---
 name: cloudflared-file-server
-description: Serve files via Cloudflare Quick Tunnel — no account, auto-expiry. Single caddy:alpine container, cloudflared cached in skill dir .build/.
+description: Serve files via Cloudflare Quick Tunnel — no account, auto-expiry. Single caddy:alpine container, cloudflared cached in skill dir .cloudflared-cache/.
 version: 3.6.0
 author: Hermes Agent
 license: MIT
@@ -38,7 +38,7 @@ Files on host  ──ro mount──→  caddy:alpine container
                                https://xxx.trycloudflare.com
 ```
 
-Single container, no Docker network, no pre-built image. Caddy comes from `caddy:alpine` base image. Cloudflared binary (~25MB) is cached in skill dir `.build/` (24h TTL) and mounted into containers — only the first invocation downloads, subsequent ones are instant. Architecture auto-detected (amd64/arm64/arm). Serve directory removed automatically after container exits.
+Single container, no Docker network, no pre-built image. Caddy comes from `caddy:alpine` base image. Cloudflared binary (~25MB) is cached in skill dir `.cloudflared-cache/` (24h TTL) and mounted into containers — only the first invocation downloads, subsequent ones are instant. Architecture auto-detected (amd64/arm64/arm). Serve directory removed automatically after container exits.
 
 ## Agent Behavior
 
@@ -78,7 +78,7 @@ https://xxx.trycloudflare.com/dog.png
 **Only use this if `cloudflared-serve` is not installed.** The script handles URL polling internally — prefer it. This recipe is the raw fallback showing what the script automates.
 
 ```bash
-# 0. Download cloudflared once (cached in .build/)
+# 0. Download cloudflared once (cached in .cloudflared-cache/)
 CLOUDFLARED_VERSION="${CLOUDFLARED_VERSION:-latest}"
 case "$(uname -m)" in
   x86_64)  CF_ARCH="amd64" ;;
@@ -86,7 +86,7 @@ case "$(uname -m)" in
   armv7l)  CF_ARCH="arm" ;;
   *)       echo "ERROR: unsupported arch" >&2; exit 1 ;;
 esac
-CLOUDFLARED_CACHED=".build/cloudflared-${CLOUDFLARED_VERSION}-$(uname -m)"
+CLOUDFLARED_CACHED=".cloudflared-cache/cloudflared-${CLOUDFLARED_VERSION}-$(uname -m)"
 if [ ! -x "$CLOUDFLARED_CACHED" ]; then
     if [ "$CLOUDFLARED_VERSION" = "latest" ]; then
         URL="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${CF_ARCH}"
@@ -166,7 +166,7 @@ docker rm -f cf-serve-$$
 - No SSE, no WebSocket support
 - No SLA — dev/testing only, not production
 - Subject to Cloudflare Terms of Service
-- First run downloads ~25MB (cloudflared binary, cached in .build/ for 24h)
+- First run downloads ~25MB (cloudflared binary, cached in .cloudflared-cache/ for 24h)
 
 ## Pitfalls
 
@@ -178,7 +178,7 @@ docker rm -f cf-serve-$$
 
 **No `--rm` on `docker run`.** The container is NOT auto-removed so that `docker logs` and `docker inspect` remain accessible after a crash. Stopped `cf-serve-*` containers are auto-pruned on next script run (60s grace period preserves recently-stopped containers for inspection).
 
-**Cloudflared cached in skill dir `.build/` (24h).** First invocation downloads ~25MB to `.build/`. Subsequent invocations mount the cached binary — no download, ~5s to tunnel URL. Cache auto-purges after 24h.
+**Cloudflared cached in skill dir `.cloudflared-cache/` (24h).** First invocation downloads ~25MB to `.cloudflared-cache/`. Subsequent invocations mount the cached binary — no download, ~5s to tunnel URL. Cache auto-purges after 24h.
 
 **Timer starts when cloudflared launches.** The auto-kill timer (`sleep $SECS; kill $CF_PID`) begins counting as soon as cloudflared starts, not after tunnel registration. For typical TTLs (5m+), the ~3-5s registration delay is negligible.
 

@@ -4,7 +4,7 @@
 # Usage: cloudflared-serve <ttl> <file1> [file2 ...]
 # TTL format: 30s, 5m, 1h (minimum 10s)
 #
-# Cloudflared binary is cached in skill dir .build/ for 24h.
+# Cloudflared binary is cached in skill dir .cloudflared-cache/ for 24h.
 # Set CLOUDFLARED_VERSION to pin a specific release (default: latest).
 
 CLOUDFLARED_VERSION="${CLOUDFLARED_VERSION:-latest}"
@@ -114,8 +114,8 @@ docker ps -a --filter 'name=cf-serve' --filter 'status=exited' --format '{{.ID}}
     esac
 done
 
-# --- Cloudflared cache (in skill dir .build/, shared across containers, 24h TTL) ---
-CLOUDFLARED_CACHE_DIR="${SKILL_DIR}/.build"
+# --- Cloudflared cache (in skill dir .cloudflared-cache/, shared across containers, 24h TTL) ---
+CLOUDFLARED_CACHE_DIR="${SKILL_DIR}/.cloudflared-cache"
 CLOUDFLARED_CACHE_KEY="${CLOUDFLARED_VERSION}-$(uname -m)"
 CLOUDFLARED_CACHED="${CLOUDFLARED_CACHE_DIR}/cloudflared-${CLOUDFLARED_CACHE_KEY}"
 find "$CLOUDFLARED_CACHE_DIR" -name 'cloudflared-*' -mtime +1 -delete 2>/dev/null || true

@@ -7,7 +7,7 @@ When you need to expose a running HTTP service (not static files), use cloudflar
 ```bash
 # Tunnel a local HTTP service
 # Run from the skill directory
-CLOUDFLARED_CACHE_DIR="$(pwd)/.build"
+CLOUDFLARED_CACHE_DIR="$(pwd)/.cloudflared-cache"
 mkdir -p "$CLOUDFLARED_CACHE_DIR"
 CLOUDFLARED_CACHED="${CLOUDFLARED_CACHE_DIR}/cloudflared-latest-$(uname -m)"
 
@@ -34,6 +34,6 @@ fi
 ## Pitfalls
 
 - **Output goes to stderr**: Use `2>&1 | tee` to capture the URL. Cloudflared doesn't print it to stdout.
-- **Binary cached at `.build/`**: Same cache as the Docker skill. Only download once.
+- **Binary cached at `.cloudflared-cache/`**: Same cache as the Docker skill. Only download once.
 - **No auto-cleanup**: Unlike the Docker skill, there's no TTL. Kill manually when done.
 - **Only tunnels HTTP**: The `--url` flag tunnels a local HTTP server. For raw TCP, use `--hostname` with a named tunnel (requires Cloudflare account).
