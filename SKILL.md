@@ -1,7 +1,7 @@
 ---
 name: cloudflared-file-server
-description: Serve files via Cloudflare Quick Tunnel — no account, auto-expiry. Single caddy:alpine container, cloudflared cached on host.
-version: 3.4.0
+description: Serve files via Cloudflare Quick Tunnel — no account, auto-expiry. Single caddy:alpine container, cloudflared cached in skill dir .build/.
+version: 3.6.0
 author: Hermes Agent
 license: MIT
 metadata:
@@ -38,13 +38,15 @@ Files on host  ──ro mount──→  caddy:alpine container
                                https://xxx.trycloudflare.com
 ```
 
-Single container, no Docker network, no pre-built image. Caddy comes from `caddy:alpine` base image. Cloudflared binary (~25MB) is cached on host at `/tmp/cloudflared-cache/` (24h TTL) and mounted into containers — only the first invocation downloads, subsequent ones are instant. Architecture auto-detected (amd64/arm64/arm). Serve directory removed automatically after container exits.
+Single container, no Docker network, no pre-built image. Caddy comes from `caddy:alpine` base image. Cloudflared binary (~25MB) is cached in skill dir `.build/` (24h TTL) and mounted into containers — only the first invocation downloads, subsequent ones are instant. Architecture auto-detected (amd64/arm64/arm). Serve directory removed automatically after container exits.
 
 ## Agent Behavior
 
 Run `cloudflared-serve` in **foreground** mode with a generous timeout (180s). The script blocks until the tunnel is registered (typically 3–5s, worst-case 120s), prints the URL to stdout, then exits. The Docker container keeps running in the background until TTL expires — but the script itself returns as soon as the tunnel URL is available. No need for background mode or manual log scraping.
 
 ## Automated Serve Script
+
+**For exposing live web services (not static files):** see `references/direct-tunnel.md` — direct cloudflared tunnel, no Docker.
 
 ```bash
 sudo ln -s "$(pwd)/scripts/serve" /usr/local/bin/cloudflared-serve
@@ -76,7 +78,7 @@ https://xxx.trycloudflare.com/dog.png
 **Only use this if `cloudflared-serve` is not installed.** The script handles URL polling internally — prefer it. This recipe is the raw fallback showing what the script automates.
 
 ```bash
-# 0. Download cloudflared once (cached at /tmp/cloudflared-cache/)
+# 0. Download cloudflared once (cached in .build/)
 CLOUDFLARED_VERSION="${CLOUDFLARED_VERSION:-latest}"
 case "$(uname -m)" in
   x86_64)  CF_ARCH="amd64" ;;
@@ -84,7 +86,7 @@ case "$(uname -m)" in
   armv7l)  CF_ARCH="arm" ;;
   *)       echo "ERROR: unsupported arch" >&2; exit 1 ;;
 esac
-CLOUDFLARED_CACHED="/tmp/cloudflared-cache/cloudflared-${CLOUDFLARED_VERSION}-$(uname -m)"
+CLOUDFLARED_CACHED=".build/cloudflared-${CLOUDFLARED_VERSION}-$(uname -m)"
 if [ ! -x "$CLOUDFLARED_CACHED" ]; then
     if [ "$CLOUDFLARED_VERSION" = "latest" ]; then
         URL="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${CF_ARCH}"
@@ -164,17 +166,19 @@ docker rm -f cf-serve-$$
 - No SSE, no WebSocket support
 - No SLA — dev/testing only, not production
 - Subject to Cloudflare Terms of Service
-- First run downloads ~25MB (cloudflared binary, cached on host for 24h)
+- First run downloads ~25MB (cloudflared binary, cached in .build/ for 24h)
 
 ## Pitfalls
 
-**Container name uses `$$` (PID) suffix (`cf-serve-$$`).** This allows concurrent instances without collision. Old instances with the same PID are cleaned up at script start. Stale named containers from old PIDs can accumulate — the script cleans them on next run.
+**Container name uses `$$` (PID) suffix (`cf-serve-$$`).** This allows concurrent instances without collision. Old instances with the same PID are cleaned up at script start. Stopped `cf-serve-*` containers are auto-pruned on next script run (with a 60s grace period for log inspection).
+
+**Docker required.** The script checks `command -v docker` upfront and exits with a clear error if Docker is not installed — avoids cryptic "command not found" failures downstream.
 
 **`caddy:alpine` has `ENTRYPOINT ["caddy"]`.** Always use `--entrypoint sh` when running the container with a custom entrypoint script, otherwise Caddy tries to interpret `sh` as a subcommand and fails.
 
-**No `--rm` on `docker run`.** The container is NOT auto-removed so that `docker logs` and `docker inspect` remain accessible after a crash. The script cleans up stale containers on next run.
+**No `--rm` on `docker run`.** The container is NOT auto-removed so that `docker logs` and `docker inspect` remain accessible after a crash. Stopped `cf-serve-*` containers are auto-pruned on next script run (60s grace period preserves recently-stopped containers for inspection).
 
-**Cloudflared cached on host (24h).** First invocation downloads ~25MB to `/tmp/cloudflared-cache/`. Subsequent invocations mount the cached binary — no download, ~5s to tunnel URL. Cache auto-purges after 24h.
+**Cloudflared cached in skill dir `.build/` (24h).** First invocation downloads ~25MB to `.build/`. Subsequent invocations mount the cached binary — no download, ~5s to tunnel URL. Cache auto-purges after 24h.
 
 **Timer starts when cloudflared launches.** The auto-kill timer (`sleep $SECS; kill $CF_PID`) begins counting as soon as cloudflared starts, not after tunnel registration. For typical TTLs (5m+), the ~3-5s registration delay is negligible.
 
@@ -184,7 +188,11 @@ docker rm -f cf-serve-$$
 
 **File changes use hard links by default.** `ln` creates a hard link — same inode, zero extra disk space. Falls back to `cp` if cross-device; a warning is printed for both files and directories when this happens.
 
-**Error-path cleanup via EXIT trap.** If the script exits before the container starts (bad TTL, missing files), the serve directory and temp files are removed. Once the container is running, deferred cleanup takes over — the trap won't double-free.
+**Duplicate basenames rejected.** Files must have unique basenames — `serve 5m a/file.txt b/file.txt` exits with an error. This prevents silent overwrites in the serve directory.
+
+**Files validated before container starts.** Existence (`-e`), readability (`-r`), and directory searchability (`-x`) are checked upfront. Inaccessible directories produce clear errors before any Docker resources are created.
+
+**Error-path cleanup + SIGINT handling via EXIT trap.** If the script exits before the tunnel URL is printed (bad TTL, missing files, crash, or Ctrl+C), the container is killed and cleaned up. Once the URL is printed, the trap leaves the container running — it continues serving until TTL expires.
 
 **`docker wait` timeout scales with TTL.** Timeout = SECS + 120s (minimum 60s). Prevents zombie background processes without wasting resources on short-lived tunnels.
 
@@ -218,6 +226,16 @@ The script works around two Docker constraints:
 
 ## Installation into Hermes
 
+The skill directory IS the git repo (`bedasrv/cloudflared-file-server`). For fresh installs:
+
+```bash
+git clone https://github.com/bedasrv/cloudflared-file-server.git ~/.hermes/skills/user/cloudflared-file-server
+sudo ln -s ~/.hermes/skills/user/cloudflared-file-server/scripts/serve /usr/local/bin/cloudflared-serve
+```
+
+For updates: `cd ~/.hermes/skills/user/cloudflared-file-server && git pull`
+
+Legacy install (via Hermes Hub):
 ```bash
 hermes skills install --force https://raw.githubusercontent.com/bedasrv/cloudflared-file-server/main/SKILL.md
 hermes skills tap add bedasrv/cloudflared-file-server

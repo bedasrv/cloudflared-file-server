@@ -4,11 +4,20 @@
 # Usage: cloudflared-serve <ttl> <file1> [file2 ...]
 # TTL format: 30s, 5m, 1h (minimum 10s)
 #
-# Cloudflared binary is cached on host at /tmp/cloudflared-cache/ for 24h.
+# Cloudflared binary is cached in skill dir .build/ for 24h.
 # Set CLOUDFLARED_VERSION to pin a specific release (default: latest).
 
 CLOUDFLARED_VERSION="${CLOUDFLARED_VERSION:-latest}"
 set -euo pipefail
+
+# --- Prerequisite checks ---
+command -v docker >/dev/null 2>&1 || { echo "ERROR: docker not found — install Docker first" >&2; exit 1; }
+
+# --- Resolve script directory (handles symlinks like /usr/local/bin/cloudflared-serve) ---
+SCRIPT_REAL="$(readlink -f "$0" 2>/dev/null)" || { echo "ERROR: readlink failed for \$0=$0" >&2; exit 1; }
+[ -n "$SCRIPT_REAL" ] || { echo "ERROR: could not resolve script path" >&2; exit 1; }
+SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_REAL")" && pwd)" || { echo "ERROR: cannot cd to script directory" >&2; exit 1; }
+SKILL_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)" || { echo "ERROR: cannot cd to skill directory" >&2; exit 1; }
 
 usage() {
     cat >&2 <<'EOF'
@@ -48,6 +57,21 @@ FILES=("$@")
 [ ${#FILES[@]} -eq 0 ] && usage
 for f in "${FILES[@]}"; do
     [ -e "$f" ] || { echo "ERROR: '$f' not found" >&2; exit 1; }
+    [ -r "$f" ] || { echo "ERROR: '$f' not readable" >&2; exit 1; }
+    if [ -d "$f" ]; then
+        [ -x "$f" ] || { echo "ERROR: directory '$f' not searchable (missing +x)" >&2; exit 1; }
+    fi
+done
+
+# --- Check for duplicate basenames ---
+declare -A _BASENAMES
+for f in "${FILES[@]}"; do
+    name=$(basename "$f")
+    if [ -n "${_BASENAMES[$name]:-}" ]; then
+        echo "ERROR: duplicate filename '$name' — files must have unique basenames" >&2
+        exit 1
+    fi
+    _BASENAMES[$name]=1
 done
 
 # --- Names ---
@@ -56,20 +80,42 @@ SERVE_DIR="/tmp/cloudflare-serve-$$"
 ENTRYPOINT="/tmp/cf-serve-entrypoint-$$.sh"
 
 # --- Trap ---
-cleanup_on_error() {
-    if ! docker inspect "$CONTAINER_NAME" --format '{{.State.Running}}' 2>/dev/null | grep -q true; then
+URL_PRINTED=false
+
+cleanup_on_exit() {
+    if docker inspect "$CONTAINER_NAME" --format '{{.State.Running}}' 2>/dev/null | grep -q true; then
+        # Container is running
+        if [ "$URL_PRINTED" = false ]; then
+            # Interrupted before URL was shown — kill the tunnel
+            echo "" >&2
+            echo "[INFO] Interrupted — tunnel closed" >&2
+            docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
+            [ -d "$SERVE_DIR" ] && rm -rf "$SERVE_DIR"
+        fi
+        # else: URL was printed, leave container for TTL
+    else
+        # Container not running (crashed or never started) — clean up
         docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
         [ -d "$SERVE_DIR" ] && rm -rf "$SERVE_DIR"
     fi
     rm -f "$ENTRYPOINT"
 }
-trap cleanup_on_error EXIT
+trap cleanup_on_exit EXIT
+trap 'exit 130' INT TERM
 
 # --- Cleanup stale serve dirs from crashed runs ---
 find /tmp -maxdepth 1 -name 'cloudflare-serve-*' -type d -mmin +30 -exec rm -rf {} + 2>/dev/null || true
 
-# --- Cloudflared cache (host-side, shared across containers, 24h TTL) ---
-CLOUDFLARED_CACHE_DIR="/tmp/cloudflared-cache"
+# --- Prune stopped cf-serve containers (preserve those stopped <60s ago) ---
+docker ps -a --filter 'name=cf-serve' --filter 'status=exited' --format '{{.ID}}\t{{.Status}}' 2>/dev/null | while IFS=$'\t' read -r id status; do
+    case "$status" in
+        *second*) ;;  # < 1 min old, keep for log inspection
+        *) docker rm -f "$id" 2>/dev/null || true ;;
+    esac
+done
+
+# --- Cloudflared cache (in skill dir .build/, shared across containers, 24h TTL) ---
+CLOUDFLARED_CACHE_DIR="${SKILL_DIR}/.build"
 CLOUDFLARED_CACHE_KEY="${CLOUDFLARED_VERSION}-$(uname -m)"
 CLOUDFLARED_CACHED="${CLOUDFLARED_CACHE_DIR}/cloudflared-${CLOUDFLARED_CACHE_KEY}"
 find "$CLOUDFLARED_CACHE_DIR" -name 'cloudflared-*' -mtime +1 -delete 2>/dev/null || true
@@ -176,6 +222,7 @@ done
 for f in "${FILES[@]}"; do
     echo "$URL/$(basename "$f")"
 done
+URL_PRINTED=true
 {
     echo ""
     echo "[INFO] ${#FILES[@]} file(s) — expires in ${TTL} (${SECS}s)"
