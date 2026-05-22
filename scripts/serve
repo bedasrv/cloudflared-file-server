@@ -84,18 +84,14 @@ URL_PRINTED=false
 
 cleanup_on_exit() {
     if docker inspect "$CONTAINER_NAME" --format '{{.State.Running}}' 2>/dev/null | grep -q true; then
-        # Container is running
         if [ "$URL_PRINTED" = false ]; then
-            # Interrupted before URL was shown — kill the tunnel
             echo "" >&2
             echo "[INFO] Interrupted — tunnel closed" >&2
-            docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
+            docker stop "$CONTAINER_NAME" 2>/dev/null || true
             [ -d "$SERVE_DIR" ] && rm -rf "$SERVE_DIR"
         fi
-        # else: URL was printed, leave container for TTL
     else
-        # Container not running (crashed or never started) — clean up
-        docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
+        docker stop "$CONTAINER_NAME" 2>/dev/null || true
         [ -d "$SERVE_DIR" ] && rm -rf "$SERVE_DIR"
     fi
     rm -f "$ENTRYPOINT"
@@ -106,13 +102,7 @@ trap 'exit 130' INT TERM
 # --- Cleanup stale serve dirs from crashed runs ---
 find /tmp -maxdepth 1 -name 'cloudflare-serve-*' -type d -mmin +30 -exec rm -rf {} + 2>/dev/null || true
 
-# --- Prune stopped cf-serve containers (preserve those stopped <60s ago) ---
-docker ps -a --filter 'name=cf-serve' --filter 'status=exited' --format '{{.ID}}\t{{.Status}}' 2>/dev/null | while IFS=$'\t' read -r id status; do
-    case "$status" in
-        *second*) ;;  # < 1 min old, keep for log inspection
-        *) docker rm -f "$id" 2>/dev/null || true ;;
-    esac
-done
+# --- Cleanup stale serve dirs from crashed runs ---
 
 # --- Cloudflared cache (in skill dir .cloudflared-cache/, shared across containers, 24h TTL) ---
 CLOUDFLARED_CACHE_DIR="${SKILL_DIR}/.cloudflared-cache"
@@ -161,10 +151,7 @@ for f in "${FILES[@]}"; do
     fi
 done
 
-# --- Remove stale container ---
-docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
-
-# --- Write entrypoint ---
+# --- Start container (--rm cleans up on exit) ---
 cat > "$ENTRYPOINT" <<'ENTRYEOF'
 #!/bin/sh
 set -e
@@ -178,10 +165,8 @@ CF_PID=$!
 (sleep "$SECS"; kill $CF_PID 2>/dev/null) &
 wait $CF_PID
 ENTRYEOF
-chmod +x "$ENTRYPOINT"
-
-# --- Start container ---
-docker run -d --name "$CONTAINER_NAME" \
+# --- Start container (--rm cleans up on exit) ---
+docker run -d --rm --name "$CONTAINER_NAME" \
     -v "$SERVE_DIR:/serve:ro" \
     -v "$ENTRYPOINT:/entrypoint.sh:ro" \
     -v "$CLOUDFLARED_CACHED:/usr/local/bin/cloudflared:ro" \
@@ -208,14 +193,14 @@ for i in $(seq 1 120); do
     docker inspect "$CONTAINER_NAME" --format '{{.State.Running}}' 2>/dev/null | grep -q true || {
         echo "ERROR: Container died before tunnel came up" >&2
         docker logs "$CONTAINER_NAME" 2>&1 | tail -20 >&2
-        docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
+        docker stop "$CONTAINER_NAME" 2>/dev/null || true
         exit 1
     }
     URL=$(docker logs "$CONTAINER_NAME" 2>&1 | grep -o 'https://[a-z0-9.-]*\.trycloudflare\.com' | head -1 || true)
     [ -n "$URL" ] && break
 done
 
-[ -z "$URL" ] && { echo "ERROR: Failed to get tunnel URL" >&2; docker rm -f "$CONTAINER_NAME" 2>/dev/null || true; exit 1; }
+[ -z "$URL" ] && { echo "ERROR: Failed to get tunnel URL" >&2; docker stop "$CONTAINER_NAME" 2>/dev/null || true; exit 1; }
 
 # --- Output ---
 # stdout: one URL per file
@@ -226,7 +211,7 @@ URL_PRINTED=true
 {
     echo ""
     echo "[INFO] ${#FILES[@]} file(s) — expires in ${TTL} (${SECS}s)"
-    echo "[INFO] Kill: docker rm -f $CONTAINER_NAME"
+    echo "[INFO] Kill: docker stop $CONTAINER_NAME"
 } >&2
 
 # Background cleanup

@@ -46,7 +46,8 @@ Run `cloudflared-serve` in **foreground** mode with a generous timeout (180s). T
 
 ## Automated Serve Script
 
-**For exposing live web services (not static files):** see `references/direct-tunnel.md` — direct cloudflared tunnel, no Docker.
+For exposing live web services (not static files): see `references/direct-tunnel.md` — direct cloudflared tunnel, no Docker.
+For managed (permanent) tunnel DNS troubleshooting: see `references/managed-tunnel-dns.md` — CNAME vs A/AAAA record fix.
 
 ```bash
 sudo ln -s "$(pwd)/scripts/serve" /usr/local/bin/cloudflared-serve
@@ -120,7 +121,7 @@ chmod +x /tmp/cf-entrypoint.sh
 
 # 3. Start container (mount cached cloudflared, skip download)
 CONTAINER_NAME="cf-serve-$$"
-docker run -d --name "$CONTAINER_NAME" \
+docker run -d --rm --name "$CONTAINER_NAME" \\
   -v "$SERVE_DIR:/serve:ro" \
   -v /tmp/cf-entrypoint.sh:/entrypoint.sh:ro \
   -v "$CLOUDFLARED_CACHED:/usr/local/bin/cloudflared:ro" \
@@ -157,7 +158,8 @@ curl -sI "https://TUNNEL.trycloudflare.com/filename"
 ## Tear Down
 
 ```bash
-docker rm -f cf-serve-$$
+# Not needed normally — container self-destructs after TTL via --rm.
+# Emergency: docker stop cf-serve-<PID>
 ```
 
 ## Limitations
@@ -170,13 +172,13 @@ docker rm -f cf-serve-$$
 
 ## Pitfalls
 
-**Container name uses `$$` (PID) suffix (`cf-serve-$$`).** This allows concurrent instances without collision. Old instances with the same PID are cleaned up at script start. Stopped `cf-serve-*` containers are auto-pruned on next script run (with a 60s grace period for log inspection).
+**Container name uses `$$` (PID) suffix (`cf-serve-$$`).** This allows concurrent instances without collision. `--rm` ensures containers auto-remove on exit — no zombie cleanup needed.
 
 **Docker required.** The script checks `command -v docker` upfront and exits with a clear error if Docker is not installed — avoids cryptic "command not found" failures downstream.
 
 **`caddy:alpine` has `ENTRYPOINT ["caddy"]`.** Always use `--entrypoint sh` when running the container with a custom entrypoint script, otherwise Caddy tries to interpret `sh` as a subcommand and fails.
 
-**No `--rm` on `docker run`.** The container is NOT auto-removed so that `docker logs` and `docker inspect` remain accessible after a crash. Stopped `cf-serve-*` containers are auto-pruned on next script run (60s grace period preserves recently-stopped containers for inspection).
+**Containers use `--rm`.** No zombie containers, no prune logic needed. `docker logs` are dumped before removal on error paths; after successful TTL expiry, logs are useless anyway.
 
 **Cloudflared cached in skill dir `.cloudflared-cache/` (24h).** First invocation downloads ~25MB to `.cloudflared-cache/`. Subsequent invocations mount the cached binary — no download, ~5s to tunnel URL. Cache auto-purges after 24h.
 
